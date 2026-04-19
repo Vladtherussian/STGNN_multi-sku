@@ -1,0 +1,40 @@
+[tool.poetry]
+package-mode = false
+
+[project]
+name = "stgnn-multi-sku"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "vladtherussian", email = "vladimir_sonin@hotmail.ca"}
+]
+requires-python = ">=3.12, <3.13"
+dependencies = [
+    "pandas (>=2.2.0,<3.0.0)",
+    "torch (>=2.11.0)",
+    "torchvision (>=0.26.0)",
+    "torchaudio (>=2.11.0)",
+    "neuralforecast",
+    "mlforecast",
+    "lightgbm",
+    "networkx",
+    "dagster",
+    "dagster-webserver", 
+    "dagster-dg", 
+    "gdown (>=6.0.0,<7.0.0)", 
+    "plotly (>=6.7.0,<7.0.0)"
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[[tool.poetry.source]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu126"
+priority = "explicit"
+
+[tool.poetry.dependencies]
+torch = {source = "pytorch"}
+torchvision = {source = "pytorch"}
+torchaudio = {source = "pytorch"}

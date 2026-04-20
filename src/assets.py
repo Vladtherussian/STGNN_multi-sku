@@ -352,22 +352,6 @@ def prepare_stgnn_tensors() -> None:
     adj_tensor = build_weighted_adjacency(static_df=static_df, stat_exog_cols=stat_exog)
     
     # 4. Reshape Temporal Features into 3D Tensors
-    # n_timesteps = df["ds"].nunique()
-    
-    # # We want to pass everything EXCEPT the ID and Time columns into the neural network
-    # ignore_cols = ["unique_id", "ds", "y"] + stat_exog
-    # temporal_features = [col for col in df.columns if col not in ignore_cols]
-    # n_features = len(temporal_features)
-    
-    # n_nodes = len(static_df)
-    
-    # # Reshape features to [Nodes, Time, Features]
-    # X_temporal = df[temporal_features].values.reshape(n_nodes, n_timesteps, n_features)
-    # X_tensor = torch.tensor(X_temporal, dtype=torch.float32)
-    
-    # # Reshape target to [Nodes, Time]
-    # y_target = df["y"].values.reshape(n_nodes, n_timesteps)
-    # y_tensor = torch.tensor(y_target, dtype=torch.float32)
     n_nodes = df["unique_id"].nunique()
     n_timesteps = df["ds"].nunique()
     
@@ -399,6 +383,15 @@ def prepare_stgnn_tensors() -> None:
     if torch.isnan(X_tensor).any() or torch.isinf(X_tensor).any():
         raise ValueError("CRITICAL: X_tensor contains NaNs or Infs! Check your upstream scaling.")
     
+    # Identify Future Covariates
+    
+    futr_exog = [
+        "price", "promo_depth", "is_weekend", "month_name",
+        "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"
+    ]
+    # Find the exact integer indices of these features inside your temporal_features list
+    futr_indices = [temporal_features.index(f) for f in futr_exog if f in temporal_features]
+    
     # 5. Save the PyTorch Dictionary payload
     tensor_path = os.path.join(processed_dir, "stgnn_tensors.pt")
     torch.save({
@@ -406,7 +399,8 @@ def prepare_stgnn_tensors() -> None:
         "y": y_tensor,
         "adj": adj_tensor,
         "n_nodes": n_nodes,
-        "n_features": n_features
+        "n_features": n_features,
+        "futr_indices": futr_indices
     }, tensor_path)
     
     print(f"Successfully built Tensors: X {X_tensor.shape}, adj {adj_tensor.shape}")
@@ -427,12 +421,14 @@ def train_hybrid_stgnn() -> None:
     payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
     X, y, adj = payload["X"], payload["y"], payload["adj"]
     n_nodes, n_features = payload["n_nodes"], payload["n_features"]
+    futr_indices = payload["futr_indices"]
+    n_futr_features = len(futr_indices)
 
     # 2. Hyperparameters
     seq_len = 56   # 56 days of history
     pred_len = 28  # 28 days forecast
-    hidden_features = 64
-    batch_size = 32
+    hidden_features = 128
+    batch_size = 64
 
     # 3. Temporal Train/Validation Split
     # We hold out the exact final 28 days for validation to match the TSMixer baseline
@@ -445,8 +441,8 @@ def train_hybrid_stgnn() -> None:
     y_val = y[:, -seq_len - pred_len:]
 
     # 4. Initialize DataLoaders
-    train_dataset = GraphTimeSeriesDataset(X_train, y_train, seq_len, pred_len)
-    val_dataset = GraphTimeSeriesDataset(X_val, y_val, seq_len, pred_len)
+    train_dataset = GraphTimeSeriesDataset(X_train, y_train, seq_len, pred_len, futr_indices)
+    val_dataset = GraphTimeSeriesDataset(X_val, y_val, seq_len, pred_len, futr_indices)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
@@ -457,7 +453,8 @@ def train_hybrid_stgnn() -> None:
         pred_len=pred_len, 
         n_nodes=n_nodes, 
         in_features=n_features, 
-        hidden_features=hidden_features
+        hidden_features=hidden_features,
+        n_futr_features=n_futr_features
     )
     
     lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj, learning_rate=1e-3)

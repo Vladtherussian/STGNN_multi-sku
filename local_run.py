@@ -1,6 +1,6 @@
 from dagster import materialize, load_assets_from_modules, RunConfig
 import src.assets as assets
-from src.assets import SalesDataConfig # <-- Import your new config class!
+from src.assets import SalesDataConfig
 
 if __name__ == "__main__":
     print("Discovering assets...")
@@ -11,12 +11,12 @@ if __name__ == "__main__":
     # Pass your parameter using the 'ops' keyword and your config object
     result = materialize(
         all_assets,
-        selection=["feature_engineering*"],
-        # run_config=RunConfig(
-        #     ops={
-        #         "load_sales_data": SalesDataConfig(downsample_dataset=True)
-        #     }
-        # )
+        # selection=["prepare_stgnn_tensors*"],
+        run_config=RunConfig(
+            ops={
+                "load_sales_data": SalesDataConfig(downsample_dataset=True)
+            }
+        )
     )
     
     if result.success:

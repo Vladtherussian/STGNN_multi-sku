@@ -22,7 +22,9 @@ dependencies = [
     "dagster-webserver", 
     "dagster-dg", 
     "gdown (>=6.0.0,<7.0.0)", 
-    "plotly (>=6.7.0,<7.0.0)"
+    "plotly (>=6.7.0,<7.0.0)", 
+    "scikit-learn (>=1.8.0,<2.0.0)", 
+    "torch-geometric (>=2.7.0,<3.0.0)"
 ]
 
 [build-system]

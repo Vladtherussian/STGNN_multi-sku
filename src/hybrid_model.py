@@ -66,16 +66,22 @@ class STGNNMixer(nn.Module):
     Upgraded architecture featuring Local Instance Normalization 
     and Top-K Graph Sparsification.
     """
-    def __init__(self, seq_len, pred_len, n_nodes, in_features, hidden_features, n_futr_features, n_blocks=3, top_k=10):
+    def __init__(self, seq_len, pred_len, n_nodes, in_features, hidden_features, n_futr_features, n_blocks=3, top_k=10, ablation_mode="full"):
         super().__init__()
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.n_nodes = n_nodes
         self.top_k = top_k # Restrict the graph to the top 10 strongest connections
+        self.ablation_mode = ablation_mode # "full", "static_graph", or "no_graph"
         
         # Trainable identities
         self.node_emb = nn.Parameter(torch.randn(n_nodes, hidden_features))
-        self.graph_alpha = nn.Parameter(torch.tensor(0.5))
+        if self.ablation_mode == "full":
+            self.graph_alpha = nn.Parameter(torch.tensor(0.5))
+        else:
+            # For ablations, we freeze alpha so it cannot learn.
+            # 1.0 means it relies 100% on the static Walmart hierarchy.
+            self.register_buffer("graph_alpha", torch.tensor(1.0))
         
         # Instance Normalization across the temporal dimension
         # This acts as our lightweight version of RevIN to stabilize the gradients
@@ -114,21 +120,31 @@ class STGNNMixer(nn.Module):
         # ---------------------------------------------------------
         # 3. Top-K Sparsified Adaptive Graph
         # ---------------------------------------------------------
-        learned_adj = torch.matmul(self.node_emb, self.node_emb.transpose(0, 1))
-        learned_adj = F.relu(learned_adj)
-        
-        # Force sparsity. Find the top K connections for each node.
-        # This prevents over-smoothing and creates sharp, interpretable edges.
-        topk_values, topk_indices = torch.topk(learned_adj, k=self.top_k, dim=1)
-        mask = torch.zeros_like(learned_adj).scatter_(1, topk_indices, 1.0)
-        
-        # Blending static business rules with learned insights.
-        # graph_alpha is a trainable parameter.
-        # If the optimizer increases alpha, it favors your hierarchy. 
-        # If it decreases alpha, it favors discovered product correlations
-        learned_adj = F.softmax(learned_adj * mask, dim=1)
-        combined_adj = (self.graph_alpha * adj) + ((1 - self.graph_alpha) * learned_adj)
-        combined_adj = F.normalize(combined_adj, p=1, dim=1)
+        if self.ablation_mode == "no_graph":
+            # ABLATION 1: Identity Matrix. Nodes only talk to themselves.
+            combined_adj = torch.eye(N, device=x.device)
+            
+        elif self.ablation_mode == "static_graph":
+            # ABLATION 2: Only use the hardcoded Walmart hierarchy
+            combined_adj = F.normalize(adj, p=1, dim=1)
+            
+        else: # "full"
+            # FULL MODEL: Blend static rules with discovered latent correlations
+            learned_adj = torch.matmul(self.node_emb, self.node_emb.transpose(0, 1))
+            learned_adj = F.relu(learned_adj)
+            
+            # Force sparsity. Find the top K connections for each node.
+            # This prevents over-smoothing and creates sharp, interpretable edges.
+            topk_values, topk_indices = torch.topk(learned_adj, k=self.top_k, dim=1)
+            mask = torch.zeros_like(learned_adj).scatter_(1, topk_indices, 1.0)
+            
+            # Blending static business rules with learned insights.
+            # graph_alpha is a trainable parameter.
+            # If the optimizer increases alpha, it favors your hierarchy. 
+            # If it decreases alpha, it favors discovered product correlations
+            learned_adj = F.softmax(learned_adj * mask, dim=1)
+            combined_adj = (self.graph_alpha * adj) + ((1 - self.graph_alpha) * learned_adj)
+            combined_adj = F.normalize(combined_adj, p=1, dim=1)
         
         for block in self.blocks:
             x = block(x, combined_adj)

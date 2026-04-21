@@ -67,7 +67,7 @@ def load_sales_data(download_m5_data: str, config: SalesDataConfig) -> tuple:
         sales_col = sales_train_eval_df.columns[sales_train_eval_df.columns.str.startswith("d_")] # Identify the sales columns
         sales_train_eval_df["total_sales"] = sales_train_eval_df[sales_col].sum(axis=1) # Sum across all days to get total sales per item
         sales_train_eval_df = sales_train_eval_df.sort_values("total_sales", ascending=False) # Sort by total sales
-        sales_train_eval_df = sales_train_eval_df.head(200) # Keep only the top 200 items
+        sales_train_eval_df = sales_train_eval_df.head(1000) # Keep only the top 200 items
         sales_train_eval_df.drop(columns=["total_sales"], inplace=True) # Drop the helper column
 
         print("Number of selected items in evaluation set:", len(sales_train_eval_df))
@@ -491,6 +491,106 @@ def train_hybrid_stgnn() -> None:
     torch.save(lit_model.state_dict(), os.path.join(model_dir, "weights.pt"))
     print(f"STGNNMixer explicitly trained and saved to {model_dir}")
 
+@asset(deps=["prepare_stgnn_tensors"])
+def train_ablation_no_graph() -> None:
+    """Ablation 1: STGNN with Spatial Routing completely disabled (Identity Matrix)."""
+    import torch
+    import pytorch_lightning as pl
+    from pytorch_lightning.callbacks import EarlyStopping
+    from torch.utils.data import DataLoader
+    import os
+    from .hybrid_model import STGNNMixer, LitSTGNNMixer, GraphTimeSeriesDataset
+
+    # 1. Load the payload
+    processed_dir = os.path.join(os.getcwd(), "data", "processed")
+    payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
+    X, y, adj = payload["X"], payload["y"], payload["adj"]
+    n_nodes, n_features = payload["n_nodes"], payload["n_features"]
+    futr_indices = payload["futr_indices"]
+    n_futr_features = len(futr_indices)
+
+    # 2. Hyperparameters & Splits
+    seq_len = 56   
+    pred_len = 28  
+    hidden_features = 128
+    batch_size = 32
+
+    val_split_idx = X.shape[1] - pred_len
+    X_train, y_train = X[:, :val_split_idx, :], y[:, :val_split_idx]
+    X_val = X[:, -seq_len - pred_len:, :]
+    y_val = y[:, -seq_len - pred_len:]
+
+    train_dataset = GraphTimeSeriesDataset(X_train, y_train, seq_len, pred_len, futr_indices)
+    val_dataset = GraphTimeSeriesDataset(X_val, y_val, seq_len, pred_len, futr_indices)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+    # 3. Initialize Model with "no_graph"
+    core_model = STGNNMixer(
+        seq_len=seq_len, pred_len=pred_len, n_nodes=n_nodes, 
+        in_features=n_features, hidden_features=hidden_features, 
+        n_futr_features=n_futr_features, 
+        ablation_mode="no_graph"
+    )
+    
+    lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj, learning_rate=1e-3)
+    trainer = pl.Trainer(max_epochs=100, callbacks=[EarlyStopping(monitor="val_loss", patience=3, mode="min")], accelerator="auto", precision="16-mixed")
+
+    print(f"Igniting No-Graph Ablation on {n_nodes} nodes...")
+    trainer.fit(lit_model, train_loader, val_loader)
+    
+    # 4. Save to a specific folder
+    out_dir = os.path.join(os.getcwd(), "data", "models", "ablation_no_graph")
+    os.makedirs(out_dir, exist_ok=True)
+    torch.save(lit_model.state_dict(), os.path.join(out_dir, "weights.pt"))
+
+@asset(deps=["prepare_stgnn_tensors"])
+def train_ablation_static_graph() -> None:
+    """Ablation 2: STGNN restricted to the human-engineered Walmart hierarchy."""
+    import torch
+    import pytorch_lightning as pl
+    from pytorch_lightning.callbacks import EarlyStopping
+    from torch.utils.data import DataLoader
+    import os
+    from .hybrid_model import STGNNMixer, LitSTGNNMixer, GraphTimeSeriesDataset
+
+    processed_dir = os.path.join(os.getcwd(), "data", "processed")
+    payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
+    X, y, adj = payload["X"], payload["y"], payload["adj"]
+    n_nodes, n_features = payload["n_nodes"], payload["n_features"]
+    futr_indices = payload["futr_indices"]
+    n_futr_features = len(futr_indices)
+
+    seq_len, pred_len, hidden_features, batch_size = 56, 28, 128, 32
+
+    val_split_idx = X.shape[1] - pred_len
+    X_train, y_train = X[:, :val_split_idx, :], y[:, :val_split_idx]
+    X_val = X[:, -seq_len - pred_len:, :]
+    y_val = y[:, -seq_len - pred_len:]
+
+    train_dataset = GraphTimeSeriesDataset(X_train, y_train, seq_len, pred_len, futr_indices)
+    val_dataset = GraphTimeSeriesDataset(X_val, y_val, seq_len, pred_len, futr_indices)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+    # Initialize Model with "static_graph"
+    core_model = STGNNMixer(
+        seq_len=seq_len, pred_len=pred_len, n_nodes=n_nodes, 
+        in_features=n_features, hidden_features=hidden_features, 
+        n_futr_features=n_futr_features, 
+        ablation_mode="static_graph"
+    )
+    
+    lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj, learning_rate=1e-3)
+    trainer = pl.Trainer(max_epochs=100, callbacks=[EarlyStopping(monitor="val_loss", patience=3, mode="min")], accelerator="auto", precision="16-mixed")
+
+    print(f"Igniting Static-Graph Ablation on {n_nodes} nodes...")
+    trainer.fit(lit_model, train_loader, val_loader)
+    
+    out_dir = os.path.join(os.getcwd(), "data", "models", "ablation_static_graph")
+    os.makedirs(out_dir, exist_ok=True)
+    torch.save(lit_model.state_dict(), os.path.join(out_dir, "weights.pt"))
+
 @asset(deps=["prepare_ml_data"])
 def train_statistical_baselines() -> None:
     """Trains classic statistical models (AutoARIMA, AutoETS) on the CPU."""
@@ -566,14 +666,23 @@ def train_deep_baselines() -> None:
     predictions.to_parquet(os.path.join(out_dir, "deep_predictions.parquet"), index=False)
     print("Deep learning predictions saved.")
 
-@asset(deps=["train_statistical_baselines", "train_deep_baselines", "train_hybrid_stgnn"])
+@asset(deps=[
+    "train_statistical_baselines", 
+    "train_deep_baselines", 
+    "train_hybrid_stgnn", 
+    "train_ablation_no_graph", 
+    "train_ablation_static_graph"
+])
 def evaluate_benchmark() -> None:
+    import pandas as pd
+    import torch
+    import os
     from .utils import calculate_m5_metrics
     from .hybrid_model import STGNNMixer, LitSTGNNMixer
     
     processed_dir = os.path.join(os.getcwd(), "data", "processed")
     pred_dir = os.path.join(os.getcwd(), "data", "predictions")
-    model_dir = os.path.join(os.getcwd(), "data", "models", "stgnnmixer")
+    os.makedirs(pred_dir, exist_ok=True)
     
     # 1. Load ML Ready Data to get the ground truth Test Set
     df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
@@ -590,53 +699,80 @@ def evaluate_benchmark() -> None:
     # Merge them into a single dataframe
     all_preds = stats_preds.merge(deep_preds, on=["unique_id", "ds"], how="inner")
     
-    # 3. Generate the STGNN Predictions on the fly
+    # ---------------------------------------------------------
+    # 3. Generate STGNN Predictions (Full + Ablations)
+    # ---------------------------------------------------------
     payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
     X, y, adj = payload["X"], payload["y"], payload["adj"]
     n_nodes, n_features = payload["n_nodes"], payload["n_features"]
     seq_len = 56
     futr_indices = payload["futr_indices"]
     
-    state_dict = torch.load(os.path.join(model_dir, "weights.pt"))
-    hidden_features = state_dict['model.node_emb'].shape[1]
-    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    core_model = STGNNMixer(seq_len, pred_len, n_nodes, n_features, hidden_features, len(futr_indices))
-    lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj.to(device))
-    lit_model.load_state_dict(state_dict)
-    lit_model.to(device)
-    lit_model.eval()
-    
     test_start_idx = X.shape[1] - pred_len
     x_hist = X[:, test_start_idx - seq_len : test_start_idx, :].unsqueeze(0).to(device)
     x_future = X[:, test_start_idx : test_start_idx + pred_len, futr_indices].unsqueeze(0).to(device)
     y_hist = y[:, test_start_idx - seq_len : test_start_idx].unsqueeze(0).to(device)
     
-    with torch.no_grad():
-        mean = y_hist.mean(dim=-1, keepdim=True)
-        std = y_hist.std(dim=-1, keepdim=True) + 1e-5
-        y_hat_norm = lit_model(x_hist, x_future)
-        y_hat = (y_hat_norm * std) + mean
-    
-    # Reshape STGNN predictions to match the DataFrame layout
-    y_hat_cpu = y_hat.squeeze(0).cpu().numpy()  # Shape: [1000, 28]
-    
-    # We need to map the nodes back to their unique_ids. 
-    # Because we sorted by unique_id during tensor creation, we can just grab the sorted unique_ids.
     ordered_unique_ids = sorted(test_df["unique_id"].unique())
     test_dates = sorted(test_df["ds"].unique())
-    
-    stgnn_records = []
-    for i, uid in enumerate(ordered_unique_ids):
-        for j, date in enumerate(test_dates):
-            stgnn_records.append({"unique_id": uid, "ds": date, "STGNNMixer": y_hat_cpu[i, j]})
+
+    # Loop through the three variations we trained
+    stgnn_models = [
+        ("STGNNMixer", "stgnnmixer", "full"),
+        ("STGNN_StaticGraph", "ablation_static_graph", "static_graph"),
+        ("STGNN_NoGraph", "ablation_no_graph", "no_graph")
+    ]
+
+    for model_name, folder_name, ablation_mode in stgnn_models:
+        weights_path = os.path.join(os.getcwd(), "data", "models", folder_name, "weights.pt")
+        
+        # If an ablation hasn't been trained yet, skip it gracefully
+        if not os.path.exists(weights_path):
+            print(f"Skipping {model_name} because weights were not found at {weights_path}.")
+            continue
             
-    stgnn_preds = pd.DataFrame(stgnn_records)
-    all_preds = all_preds.merge(stgnn_preds, on=["unique_id", "ds"], how="inner")
-    
+        state_dict = torch.load(weights_path)
+        hidden_features = state_dict['model.node_emb'].shape[1]
+        
+        core_model = STGNNMixer(
+            seq_len=seq_len, pred_len=pred_len, n_nodes=n_nodes, 
+            in_features=n_features, hidden_features=hidden_features, 
+            n_futr_features=len(futr_indices), ablation_mode=ablation_mode
+        )
+        
+        lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj.to(device))
+        lit_model.load_state_dict(state_dict)
+        lit_model.to(device)
+        lit_model.eval()
+        
+        with torch.no_grad():
+            mean = y_hist.mean(dim=-1, keepdim=True)
+            std = y_hist.std(dim=-1, keepdim=True) + 1e-5
+            y_hat_norm = lit_model(x_hist, x_future)
+            y_hat = (y_hat_norm * std) + mean
+        
+        y_hat_cpu = y_hat.squeeze(0).cpu().numpy()  # Shape: [1000, 28]
+        
+        stgnn_records = []
+        for i, uid in enumerate(ordered_unique_ids):
+            for j, date in enumerate(test_dates):
+                stgnn_records.append({"unique_id": uid, "ds": date, model_name: y_hat_cpu[i, j]})
+                
+        stgnn_preds = pd.DataFrame(stgnn_records)
+        all_preds = all_preds.merge(stgnn_preds, on=["unique_id", "ds"], how="inner")
+
+    # ---------------------------------------------------------
     # 4. Calculate Final Metrics
+    # ---------------------------------------------------------
     print("\nCalculating rigorous M5 validation metrics...")
-    model_names = ["AutoARIMA", "AutoETS", "TSMixerx", "TFT", "NHITS", "STGNNMixer"]
+    
+    # Update the names list to include your ablations
+    model_names = ["AutoARIMA", "AutoETS", "TSMixerx", "TFT", "NHITS", "STGNNMixer", "STGNN_StaticGraph", "STGNN_NoGraph"]
+    
+    # Filter the list down to models that actually exist in the dataframe
+    model_names = [m for m in model_names if m in all_preds.columns]
+    
     results_df = calculate_m5_metrics(train_df, test_df, all_preds, model_names, pred_len)
     
     print("\n" + "="*80)
@@ -645,12 +781,13 @@ def evaluate_benchmark() -> None:
     print(results_df.to_string(index=False))
     print("="*80 + "\n")
 
-    # Merge the actual ground truth and save the master file
+    # ---------------------------------------------------------
+    # 5. Merge the actual ground truth and save the master file
     # ---------------------------------------------------------
     # Add the actual sales ('y') to our predictions dataframe
     all_preds = all_preds.merge(test_df[['unique_id', 'ds', 'y']], on=["unique_id", "ds"], how="inner")
     
-    # Save the master evaluation file
+    # Save the master evaluation file for Plotly Visualization
     final_pred_path = os.path.join(pred_dir, "final_eval_predictions.parquet")
     all_preds.to_parquet(final_pred_path, index=False)
     print(f"Master predictions file saved for visualization: {final_pred_path}")

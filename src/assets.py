@@ -428,24 +428,31 @@ def train_hybrid_stgnn() -> None:
     seq_len = 56   # 56 days of history
     pred_len = 28  # 28 days forecast
     hidden_features = 128
-    batch_size = 64
+    batch_size = 32
 
-    # 3. Temporal Train/Validation Split
-    # We hold out the exact final 28 days for validation to match the TSMixer baseline
-    val_split_idx = X.shape[1] - pred_len
+    # 3. Temporal Train/Validation/Test Split
+    test_start_idx = X.shape[1] - pred_len
+    val_start_idx = test_start_idx - pred_len
     
-    X_train, y_train = X[:, :val_split_idx, :], y[:, :val_split_idx]
+    # Train data: Everything up to the validation window
+    X_train, y_train = X[:, :val_start_idx, :], y[:, :val_start_idx]
     
-    # We only need enough validation data to create a single window evaluating the last 28 days
-    X_val = X[:, -seq_len - pred_len:, :]
-    y_val = y[:, -seq_len - pred_len:]
+    # Validation data: Needs `seq_len` of history prior to `val_start_idx`
+    X_val = X[:, val_start_idx - seq_len : test_start_idx, :]
+    y_val = y[:, val_start_idx - seq_len : test_start_idx]
+
+    # Test data: Needs `seq_len` of history prior to `test_start_idx`
+    X_test = X[:, test_start_idx - seq_len :, :]
+    y_test = y[:, test_start_idx - seq_len :]
 
     # 4. Initialize DataLoaders
     train_dataset = GraphTimeSeriesDataset(X_train, y_train, seq_len, pred_len, futr_indices)
     val_dataset = GraphTimeSeriesDataset(X_val, y_val, seq_len, pred_len, futr_indices)
+    test_dataset = GraphTimeSeriesDataset(X_test, y_test, seq_len, pred_len, futr_indices)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
 
     # 5. Initialize the Custom Hybrid Architecture
     core_model = STGNNMixer(
@@ -459,17 +466,24 @@ def train_hybrid_stgnn() -> None:
     
     lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj, learning_rate=1e-3)
 
-    # 6. Ignite PyTorch Lightning
+    # 6. Ignite PyTorch Lightning & Evaluate
     early_stop_callback = EarlyStopping(monitor="val_loss", patience=3, mode="min")
     
     trainer = pl.Trainer(
         max_epochs=100, 
         callbacks=[early_stop_callback], 
-        accelerator="auto" # Will automatically detect and use your RTX GPU!
+        accelerator="auto",
+        precision="16-mixed"
     )
 
-    print(f"Igniting Custom STGNNMixer on {n_nodes} nodes with multi-relational spatial routing...")
+    print(f"Igniting Custom STGNNMixer on {n_nodes} nodes...")
     trainer.fit(lit_model, train_loader, val_loader)
+    
+    # NEW: Run the final blind benchmark!
+    print("\n" + "="*50)
+    print("🚀 RUNNING FINAL BENCHMARK ON UNSEEN TEST SET 🚀")
+    print("="*50)
+    trainer.test(lit_model, test_loader)
     
     # 7. Save the trained weights
     model_dir = os.path.join(os.getcwd(), "data", "models", "stgnnmixer")
@@ -477,56 +491,476 @@ def train_hybrid_stgnn() -> None:
     torch.save(lit_model.state_dict(), os.path.join(model_dir, "weights.pt"))
     print(f"STGNNMixer explicitly trained and saved to {model_dir}")
 
-
 @asset(deps=["prepare_ml_data"])
-def train_tsmixerx() -> None:
-    from neuralforecast import NeuralForecast
-    from neuralforecast.models import TSMixerx
+def train_statistical_baselines() -> None:
+    """Trains classic statistical models (AutoARIMA, AutoETS) on the CPU."""
+    from statsforecast import StatsForecast
+    from statsforecast.models import AutoARIMA, AutoETS
     
-    # 1. Load the ML-ready data
     processed_dir = os.path.join(os.getcwd(), "data", "processed")
     df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
     
-    # 2. Extract configuration limits
+    pred_len = 28
+    all_dates = sorted(df["ds"].unique())
+    test_start_date = all_dates[-pred_len]
+    
+    # Isolate to strictly univariate data (No Exogenous Variables)
+    df_train = df[df["ds"] < test_start_date][['unique_id', 'ds', 'y']].copy()
+    
+    # Season length 7 captures weekly retail cycles
+    models = [AutoARIMA(season_length=7), AutoETS(season_length=7)]
+    
+    sf = StatsForecast(models=models, freq='D', n_jobs=-1)
+    
+    print("Fitting Statistical Baselines (AutoARIMA, AutoETS)...")
+    sf.fit(df=df_train)
+    predictions = sf.predict(h=pred_len)
+    predictions = predictions.reset_index()
+    
+    out_dir = os.path.join(os.getcwd(), "data", "predictions")
+    os.makedirs(out_dir, exist_ok=True)
+    predictions.to_parquet(os.path.join(out_dir, "stats_predictions.parquet"), index=False)
+    print("Statistical baseline predictions saved.")
+
+@asset(deps=["prepare_ml_data"])
+def train_deep_baselines() -> None:
+    """Trains deep learning benchmarks (TSMixerx, TFT, NHITS) on the GPU."""
+    from neuralforecast import NeuralForecast
+    from neuralforecast.models import TSMixerx, TFT, NHITS
+    
+    processed_dir = os.path.join(os.getcwd(), "data", "processed")
+    df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
+    
     n_series = df["unique_id"].nunique()
+    pred_len = 28
     
-    # 3. Categorize Exogenous Variables
+    all_dates = sorted(df["ds"].unique())
+    test_start_date = all_dates[-pred_len]
+    df_train_val = df[df["ds"] < test_start_date].copy()
+    df_test = df[df["ds"] >= test_start_date].copy()
+    
     stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
-    
-    futr_exog = [
-        "price", "promo_depth", "is_weekend", "month_name",
-        "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"
-    ]
-    
+    futr_exog = ["price", "promo_depth", "is_weekend", "month_name", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
     hist_exog = [col for col in df.columns if 'lag' in col or 'mean' in col or 'std' in col or 'roll_sum' in col]
 
-    # 4. Initialize the Implicit Spatial Model
-    model = TSMixerx(
-        h=28,                  
-        input_size=28 * 2,     
-        n_series=n_series,     
-        stat_exog_list=stat_exog,
-        hist_exog_list=hist_exog,
-        futr_exog_list=futr_exog,
-        scaler_type='standard',
-        max_steps=100,         # Fast execution for your local benchmark
-        early_stop_patience_steps=3,
+    # Initialize all models (keeping max_steps low for quick execution on your local rig)
+    models = [
+        TSMixerx(h=pred_len, input_size=pred_len*2, n_series=n_series, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100),
+        TFT(h=pred_len, input_size=pred_len*2, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100),
+        NHITS(h=pred_len, input_size=pred_len*2, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100)
+    ]
+    
+    nf = NeuralForecast(models=models, freq='D')
+    static_df = df_train_val[["unique_id"] + stat_exog].drop_duplicates()
+    
+    print("Igniting Deep Learning Baselines (TSMixerx, TFT, NHITS)...")
+    nf.fit(df=df_train_val, static_df=static_df, val_size=pred_len)
+    
+    # Generate test predictions
+    futr_df = df_test[['unique_id', 'ds'] + futr_exog]
+    predictions = nf.predict(df=df_train_val, static_df=static_df, futr_df=futr_df)
+    predictions = predictions.reset_index()
+    
+    out_dir = os.path.join(os.getcwd(), "data", "predictions")
+    os.makedirs(out_dir, exist_ok=True)
+    predictions.to_parquet(os.path.join(out_dir, "deep_predictions.parquet"), index=False)
+    print("Deep learning predictions saved.")
+
+@asset(deps=["train_statistical_baselines", "train_deep_baselines", "train_hybrid_stgnn"])
+def evaluate_benchmark() -> None:
+    from .utils import calculate_m5_metrics
+    from .hybrid_model import STGNNMixer, LitSTGNNMixer
+    
+    processed_dir = os.path.join(os.getcwd(), "data", "processed")
+    pred_dir = os.path.join(os.getcwd(), "data", "predictions")
+    model_dir = os.path.join(os.getcwd(), "data", "models", "stgnnmixer")
+    
+    # 1. Load ML Ready Data to get the ground truth Test Set
+    df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
+    pred_len = 28
+    all_dates = sorted(df["ds"].unique())
+    test_start_date = all_dates[-pred_len]
+    train_df = df[df["ds"] < test_start_date].copy()
+    test_df = df[df["ds"] >= test_start_date].copy()
+    
+    # 2. Load the Baseline Predictions
+    stats_preds = pd.read_parquet(os.path.join(pred_dir, "stats_predictions.parquet"))
+    deep_preds = pd.read_parquet(os.path.join(pred_dir, "deep_predictions.parquet"))
+    
+    # Merge them into a single dataframe
+    all_preds = stats_preds.merge(deep_preds, on=["unique_id", "ds"], how="inner")
+    
+    # 3. Generate the STGNN Predictions on the fly
+    payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
+    X, y, adj = payload["X"], payload["y"], payload["adj"]
+    n_nodes, n_features = payload["n_nodes"], payload["n_features"]
+    seq_len = 56
+    futr_indices = payload["futr_indices"]
+    
+    state_dict = torch.load(os.path.join(model_dir, "weights.pt"))
+    hidden_features = state_dict['model.node_emb'].shape[1]
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    core_model = STGNNMixer(seq_len, pred_len, n_nodes, n_features, hidden_features, len(futr_indices))
+    lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj.to(device))
+    lit_model.load_state_dict(state_dict)
+    lit_model.to(device)
+    lit_model.eval()
+    
+    test_start_idx = X.shape[1] - pred_len
+    x_hist = X[:, test_start_idx - seq_len : test_start_idx, :].unsqueeze(0).to(device)
+    x_future = X[:, test_start_idx : test_start_idx + pred_len, futr_indices].unsqueeze(0).to(device)
+    y_hist = y[:, test_start_idx - seq_len : test_start_idx].unsqueeze(0).to(device)
+    
+    with torch.no_grad():
+        mean = y_hist.mean(dim=-1, keepdim=True)
+        std = y_hist.std(dim=-1, keepdim=True) + 1e-5
+        y_hat_norm = lit_model(x_hist, x_future)
+        y_hat = (y_hat_norm * std) + mean
+    
+    # Reshape STGNN predictions to match the DataFrame layout
+    y_hat_cpu = y_hat.squeeze(0).cpu().numpy()  # Shape: [1000, 28]
+    
+    # We need to map the nodes back to their unique_ids. 
+    # Because we sorted by unique_id during tensor creation, we can just grab the sorted unique_ids.
+    ordered_unique_ids = sorted(test_df["unique_id"].unique())
+    test_dates = sorted(test_df["ds"].unique())
+    
+    stgnn_records = []
+    for i, uid in enumerate(ordered_unique_ids):
+        for j, date in enumerate(test_dates):
+            stgnn_records.append({"unique_id": uid, "ds": date, "STGNNMixer": y_hat_cpu[i, j]})
+            
+    stgnn_preds = pd.DataFrame(stgnn_records)
+    all_preds = all_preds.merge(stgnn_preds, on=["unique_id", "ds"], how="inner")
+    
+    # 4. Calculate Final Metrics
+    print("\nCalculating rigorous M5 validation metrics...")
+    model_names = ["AutoARIMA", "AutoETS", "TSMixerx", "TFT", "NHITS", "STGNNMixer"]
+    results_df = calculate_m5_metrics(train_df, test_df, all_preds, model_names, pred_len)
+    
+    print("\n" + "="*80)
+    print("🏆 FINAL FORECASTING TOURNAMENT LEADERBOARD 🏆")
+    print("="*80)
+    print(results_df.to_string(index=False))
+    print("="*80 + "\n")
+
+    # Merge the actual ground truth and save the master file
+    # ---------------------------------------------------------
+    # Add the actual sales ('y') to our predictions dataframe
+    all_preds = all_preds.merge(test_df[['unique_id', 'ds', 'y']], on=["unique_id", "ds"], how="inner")
+    
+    # Save the master evaluation file
+    final_pred_path = os.path.join(pred_dir, "final_eval_predictions.parquet")
+    all_preds.to_parquet(final_pred_path, index=False)
+    print(f"Master predictions file saved for visualization: {final_pred_path}")
+
+# @asset(deps=["prepare_ml_data"])
+# def train_tsmixerx() -> None:
+#     from neuralforecast import NeuralForecast
+#     from neuralforecast.models import TSMixerx
+#     import pandas as pd
+#     import os
+    
+#     processed_dir = os.path.join(os.getcwd(), "data", "processed")
+#     df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
+    
+#     n_series = df["unique_id"].nunique()
+#     pred_len = 28
+    
+#     # NEW: Split the dataframe by Date to match the STGNN tensors
+#     all_dates = sorted(df["ds"].unique())
+#     test_start_date = all_dates[-pred_len]
+    
+#     # Training + Validation DataFrame (TSMixerx will split this internally using val_size=28)
+#     df_train_val = df[df["ds"] < test_start_date].copy()
+    
+#     # Test DataFrame (Strictly held out)
+#     df_test = df[df["ds"] >= test_start_date].copy()
+    
+#     stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
+#     futr_exog = ["price", "promo_depth", "is_weekend", "month_name", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
+#     hist_exog = [col for col in df.columns if 'lag' in col or 'mean' in col or 'std' in col or 'roll_sum' in col]
+
+#     model = TSMixerx(
+#         h=pred_len,                  
+#         input_size=pred_len * 2,     
+#         n_series=n_series,     
+#         stat_exog_list=stat_exog,
+#         hist_exog_list=hist_exog,
+#         futr_exog_list=futr_exog,
+#         scaler_type='standard',
+#         max_steps=100,         
+#         early_stop_patience_steps=3,
+#     )
+    
+#     nf = NeuralForecast(models=[model], freq='D')
+#     static_df = df_train_val[["unique_id"] + stat_exog].drop_duplicates()
+    
+#     print(f"Igniting TSMixerx baseline...")
+#     # Train only on the pre-test data
+#     nf.fit(df=df_train_val, static_df=static_df, val_size=pred_len)
+    
+#     print("\n" + "="*50)
+#     print("🚀 RUNNING BASELINE BENCHMARK ON UNSEEN TEST SET 🚀")
+#     print("="*50)
+    
+#     # Provide the future exogenous covariates so it can forecast the test period
+#     futr_df = df_test[['unique_id', 'ds'] + futr_exog]
+#     predictions = nf.predict(df=df_train_val, static_df=static_df, futr_df=futr_df)
+    
+#     # Merge and calculate actual MAE
+#     results = predictions.merge(df_test[['unique_id', 'ds', 'y']], on=['unique_id', 'ds'], how='left')
+#     mae = (results['TSMixerx'] - results['y']).abs().mean()
+#     print(f"TSMixerx Test MAE: {mae:.4f}")
+#     print("="*50 + "\n")
+    
+#     model_dir = os.path.join(os.getcwd(), "data", "models", "tsmixerx")
+#     os.makedirs(model_dir, exist_ok=True)
+#     nf.save(path=model_dir, model_index=None, overwrite=True, save_dataset=False)
+
+
+@asset(deps=["train_hybrid_stgnn"])
+def explain_forecast_captum() -> None:
+    import torch
+    import os
+    import numpy as np
+    import pandas as pd
+    from pathlib import Path
+    from captum.attr import IntegratedGradients
+    from .hybrid_model import STGNNMixer, LitSTGNNMixer
+
+    # 1. Setup paths
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+    processed_dir = os.path.join(DATA_DIR, "processed")
+    model_dir = os.path.join(DATA_DIR, "models", "stgnnmixer")
+
+    # 2A. Extract Exact Feature Names & Product Metadata
+    df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
+    stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
+    ignore_cols = ["unique_id", "ds", "y"] + stat_exog
+    df_numeric = df.select_dtypes(include=[np.number])
+    feature_names = [col for col in df_numeric.columns if col not in ignore_cols]
+
+    # Create a lookup table for the nodes
+    # Load the un-encoded data to get the real string names
+    raw_df = pd.read_parquet(os.path.join(processed_dir, "model_input.parquet"))
+    
+    # Filter to only the items that made it into our final dataset, 
+    # and sort them by unique_id so they perfectly match the PyTorch tensor indices.
+    valid_ids = df["unique_id"].unique()
+    static_df = raw_df[raw_df["unique_id"].isin(valid_ids)][
+        ["unique_id", "item_id", "dept_id", "store_id"]
+    ].drop_duplicates().sort_values("unique_id").reset_index(drop=True)
+
+    # 2B. Load Tensors & Hyperparameters
+    payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
+    X, y, adj = payload["X"], payload["y"], payload["adj"]
+    n_nodes, n_features = payload["n_nodes"], payload["n_features"]
+    
+    seq_len = 56
+    pred_len = 28
+    futr_indices = payload["futr_indices"]
+    n_futr_features = len(futr_indices)
+    
+    weights_path = os.path.join(model_dir, "weights.pt")
+    state_dict = torch.load(weights_path)
+    hidden_features = state_dict['model.node_emb'].shape[1]
+
+    # 3. GPU Acceleration Setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    x_hist = X[:, -seq_len-pred_len : -pred_len, :].unsqueeze(0).to(device)
+    x_future = X[:, -pred_len:, futr_indices].unsqueeze(0).to(device)
+
+    core_model = STGNNMixer(seq_len, pred_len, n_nodes, n_features, hidden_features, n_futr_features)
+    lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj.to(device))
+    lit_model.load_state_dict(state_dict)
+    lit_model.to(device)
+    lit_model.eval()
+
+    # Define Target Node
+    TARGET_NODE_IDX = 0
+    target_metadata = static_df.iloc[TARGET_NODE_IDX]
+
+    class NodeForecastWrapper(torch.nn.Module):
+        def __init__(self, model, target_node, target_day):
+            super().__init__()
+            self.model = model
+            self.target_node = target_node
+            self.target_day = target_day
+
+        def forward(self, hist, futr):
+            out = self.model(hist, futr)
+            return out[:, self.target_node, self.target_day]
+
+    wrapper_model = NodeForecastWrapper(lit_model, target_node=TARGET_NODE_IDX, target_day=0)
+
+    baseline_hist = torch.zeros_like(x_hist).to(device)
+    baseline_futr = torch.zeros_like(x_future).to(device)
+
+    # 4. Ignite Integrated Gradients
+    print(f"Calculating Integrated Gradients for {target_metadata['item_id']} at {target_metadata['store_id']}...")
+    ig = IntegratedGradients(wrapper_model)
+    
+    attributions = ig.attribute(
+        inputs=(x_hist, x_future),
+        baselines=(baseline_hist, baseline_futr),
+        n_steps=50, 
+        internal_batch_size=1
     )
     
-    # 5. Build and train the pipeline
-    nf = NeuralForecast(models=[model], freq='D')
+    attr_hist, attr_futr = attributions
 
-    # Grab the unique_id and static columns, and drop all the duplicate daily rows
-    static_cols = ["unique_id"] + stat_exog
-    static_df = df[static_cols].drop_duplicates()
+    # Move results back to CPU
+    attr_hist_cpu = attr_hist.detach().cpu().numpy()
+    attr_futr_cpu = attr_futr.detach().cpu().numpy()
     
-    print(f"Igniting TSMixerx on {n_series} interconnected time series...")
-    nf.fit(df=df, static_df=static_df, val_size=28)
+    # ---------------------------------------------------------
+    # NEW: 5. Spatial (Cross-Item) Influence Calculation
+    # ---------------------------------------------------------
+    # 1. Magnitude: Who has the biggest overall impact? (Absolute sum)
+    magnitude_influence = np.abs(attr_hist_cpu[0]).sum(axis=(1, 2))
+    magnitude_influence[TARGET_NODE_IDX] = 0.0 
     
-    # 6. Save the trained artifact
-    model_dir = os.path.join(os.getcwd(), "data", "models", "tsmixerx")
-    os.makedirs(model_dir, exist_ok=True)
-    nf.save(path=model_dir, model_index=None, overwrite=True, save_dataset=False)
-    print(f"TSMixerx baseline successfully saved to {model_dir}")
+    # 2. Direction: Is it a Halo (+) or Cannibalization (-)? (Raw sum)
+    directional_influence = attr_hist_cpu[0].sum(axis=(1, 2))
+    
+    # Get top 3 most influential external nodes by MAGNITUDE
+    top_spatial_indices = np.argsort(magnitude_influence)[-3:][::-1]
+
+    # Node 0's own feature importance (Using axis=0 for NumPy!)
+    total_hist_importance = attr_hist_cpu[0, TARGET_NODE_IDX].sum(axis=0)
+    total_futr_importance = attr_futr_cpu[0, TARGET_NODE_IDX].sum(axis=0)
+    
+    print("\n" + "━"*70)
+    print("🧠 EXPLAINABLE AI: MULTI-RELATIONAL ATTRIBUTION 🧠")
+    print("━"*70)
+    print(f"TARGET ITEM: {target_metadata['item_id']} | Dept: {target_metadata['dept_id']} | Store: {target_metadata['store_id']}")
+    print("━"*70)
+    
+    print("\n[1] OWN FEATURE IMPORTANCE (What intrinsic data drove this forecast?)")
+    print("--- Future Covariates ---")
+    for i, futr_idx in enumerate(futr_indices):
+        name = feature_names[futr_idx]
+        print(f"{name.ljust(25)}: {total_futr_importance[i]:+.4f}")
+        
+    print("\n--- Historical Features (Top 3) ---")
+    top_hist_indices = np.argsort(np.abs(total_hist_importance))[-3:][::-1]
+    for idx in top_hist_indices:
+        name = feature_names[idx]
+        print(f"{name.ljust(25)}: {total_hist_importance[idx]:+.4f}")
+
+    print("\n[2] SPATIAL INFLUENCE (Which OTHER products drove this forecast?)")
+    for rank, idx in enumerate(top_spatial_indices):
+        inf_node = static_df.iloc[idx]
+        mag_score = magnitude_influence[idx]
+        dir_score = directional_influence[idx]
+        
+        # Determine the economic relationship!
+        relationship = "HALO EFFECT (+)" if dir_score > 0 else "CANNIBALIZATION (-)"
+        
+        print(f"#{rank+1} Influence (Magnitude {mag_score:.4f}):")
+        print(f"    Item:  {inf_node['item_id']} | Type: {relationship} ({dir_score:+.4f})")
+        print(f"    Store: {inf_node['store_id']} | Dept: {inf_node['dept_id']}")
+        
+        if inf_node['dept_id'] != target_metadata['dept_id']:
+            print("    *CROSS-DEPARTMENT DISCOVERY*")
+        
+    print("━"*70 + "\n")
 
 
+# @asset(deps=["train_hybrid_stgnn"])
+# def simulate_promotion_shock() -> None:
+#     import torch
+#     import os
+#     from .hybrid_model import STGNNMixer, LitSTGNNMixer
+#     from pathlib import Path
+
+#     # 1. Setup paths to guarantee we hit the correct root directory
+#     PROJECT_ROOT = Path(__file__).resolve().parent.parent
+#     DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+#     processed_dir = os.path.join(DATA_DIR, "processed")
+#     model_dir = os.path.join(DATA_DIR, "models", "stgnnmixer")
+
+#     # 2. Load the exact ML-ready tensors used for training
+#     payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
+#     X, y, adj = payload["X"], payload["y"], payload["adj"]
+#     n_nodes, n_features = payload["n_nodes"], payload["n_features"]
+
+#     # 3. Network Hyperparameters 
+#     seq_len = 56
+#     pred_len = 28
+#     hidden_features = 128  # Keeping the memory-optimized size
+    
+#     # Identify future covariates (price, promo_depth, events, etc.)
+#     # In your previous asset, you defined 9 future features
+#     futr_indices = payload["futr_indices"]
+#     n_futr_features = len(futr_indices)
+
+#     # 4. Extract a single test window (the last 84 days of the dataset)
+#     x_hist = X[:, -seq_len-pred_len : -pred_len, :].unsqueeze(0) # [1, Nodes, 56, Feat]
+#     y_hist = y[:, -seq_len-pred_len : -pred_len].unsqueeze(0)    # [1, Nodes, 56]
+    
+#     # Extract the true, unmodified future events
+#     x_future_base = X[:, -pred_len:, futr_indices].unsqueeze(0)  # [1, Nodes, 28, Futr_Feat]
+
+#     # 5. Initialize the Core PyTorch Architecture
+#     core_model = STGNNMixer(
+#         seq_len=seq_len, 
+#         pred_len=pred_len, 
+#         n_nodes=n_nodes, 
+#         in_features=n_features, 
+#         hidden_features=hidden_features,
+#         n_futr_features=n_futr_features
+#     )
+    
+#     # Wrap in Lightning and load the trained weights from the RTX 3080
+#     lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj)
+#     weights_path = os.path.join(model_dir, "weights.pt")
+#     lit_model.load_state_dict(torch.load(weights_path))
+#     lit_model.eval() # Lock the model into inference mode
+
+#     # 6. Generate Baseline Forecast (Business as Usual)
+#     with torch.no_grad():
+#         # Apply your RevIN normalization manually for this single inference
+#         mean = y_hist.mean(dim=-1, keepdim=True)
+#         std = y_hist.std(dim=-1, keepdim=True) + 1e-5
+        
+#         y_hat_norm_base = lit_model(x_hist, x_future_base)
+#         y_hat_base = (y_hat_norm_base * std) + mean
+
+#     # 7. 💥 THE CAUSAL SHOCK 💥
+#     # We clone the future data to create an alternate reality
+#     x_future_shock = x_future_base.clone()
+    
+#     # Target Node 0. Index 1 in the future features is 'promo_depth'
+#     # We add 3.0 (which represents a massive 3 standard deviation promotional discount)
+#     # to all 28 days in the forecast horizon.
+#     x_future_shock[0, 0, :, 1] += 3.0 
+    
+#     # Generate the Shocked Forecast
+#     with torch.no_grad():
+#         y_hat_norm_shock = lit_model(x_hist, x_future_shock)
+#         y_hat_shock = (y_hat_norm_shock * std) + mean
+
+#     # 8. Calculate the Delta
+#     # How many extra (or fewer) units were sold over the 28 days due to the shock?
+#     node_0_diff = (y_hat_shock[0, 0, :] - y_hat_base[0, 0, :]).sum().item()
+#     node_584_diff = (y_hat_shock[0, 584, :] - y_hat_base[0, 584, :]).sum().item()
+#     node_646_diff = (y_hat_shock[0, 646, :] - y_hat_base[0, 646, :]).sum().item()
+
+#     print("\n" + "━"*50)
+#     print("💥 CAUSAL PROMOTION SHOCK RESULTS 💥")
+#     print("━"*50)
+#     print("Action: Artificially applied a massive promotion to Node 0.")
+#     print(f"-> Node 0 (Targeted Item) 28-Day Impact:     {node_0_diff:+.2f} units")
+#     print(f"-> Node 584 (Strongest Link) Sales Impact:   {node_584_diff:+.2f} units")
+#     print(f"-> Node 646 (2nd Strongest Link) Impact:     {node_646_diff:+.2f} units")
+    
+#     if node_584_diff < 0:
+#         print("\nInsight: The graph successfully simulated CANNIBALIZATION.")
+#     else:
+#         print("\nInsight: The graph successfully simulated a HALO EFFECT.")
+#     print("━"*50 + "\n")

@@ -11,12 +11,12 @@ if __name__ == "__main__":
     # Pass your parameter using the 'ops' keyword and your config object
     result = materialize(
         all_assets,
-        # selection=["prepare_stgnn_tensors*"],
-        run_config=RunConfig(
-            ops={
-                "load_sales_data": SalesDataConfig(downsample_dataset=True)
-            }
-        )
+        selection=["prepare_stgnn_tensors*"],
+        # run_config=RunConfig(
+        #     ops={
+        #         "load_sales_data": SalesDataConfig(downsample_dataset=True)
+        #     }
+        # )
     )
     
     if result.success:

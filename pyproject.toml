@@ -24,7 +24,9 @@ dependencies = [
     "gdown (>=6.0.0,<7.0.0)", 
     "plotly (>=6.7.0,<7.0.0)", 
     "scikit-learn (>=1.8.0,<2.0.0)", 
-    "torch-geometric (>=2.7.0,<3.0.0)"
+    "torch-geometric (>=2.7.0,<3.0.0)", 
+    "captum (>=0.9.0,<0.10.0)", 
+    "statsforecast (>=2.0.3,<3.0.0)"
 ]
 
 [build-system]
@@ -40,3 +42,7 @@ priority = "explicit"
 torch = {source = "pytorch"}
 torchvision = {source = "pytorch"}
 torchaudio = {source = "pytorch"}
+[dependency-groups]
+dev = [
+    "ipykernel (>=7.2.0,<8.0.0)"
+]

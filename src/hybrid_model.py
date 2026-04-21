@@ -40,20 +40,21 @@ class GraphMixerBlock(nn.Module):
         # Add residual connection
         x = x + x_temp
         
-        # --- Spatial Mixing (Graph Convolution) ---
-        # DenseGCNConv expects [Batch, Nodes, Features]. 
-        # We loop through the time steps (Seq_len) to apply the graph across the features at each day.
-        out_spatial = []
-        for t in range(S):
-            # Extract the graph state at time t: shape [B, N, Feat]
-            x_t = x[:, :, t, :] 
-            
-            # Pass through the Graph Convolution using your adjacency matrix!
-            gcn_out = self.spatial_gcn(x_t, adj)
-            out_spatial.append(gcn_out.unsqueeze(2))
-            
-        # Recombine time steps
-        x_spatial = torch.cat(out_spatial, dim=2) # [B, N, S, Feat]
+        # --- Spatial Mixing (Optimized Parallel Graph Convolution) ---
+        # 1. Swap Seq_len and Nodes -> [Batch, Seq_len, Nodes, Features]
+        x_reshaped = x.permute(0, 2, 1, 3) 
+        
+        # 2. Flatten Batch and Seq_len into one massive effective batch
+        # Shape becomes: [(Batch * Seq_len), Nodes, Features]
+        x_flat = x_reshaped.reshape(B * S, N, Feat)
+        
+        # 3. Apply the Graph Convolution ONCE across all time steps simultaneously!
+        # PyTorch automatically broadcasts your [N, N] adjacency matrix across the new batch size.
+        gcn_out = self.spatial_gcn(x_flat, adj) 
+        
+        # 4. Unflatten back to the original dimensions
+        # View separates the Batch and Time, Permute puts Nodes back in the right spot
+        x_spatial = gcn_out.view(B, S, N, Feat).permute(0, 2, 1, 3) # -> [B, N, S, Feat]
         
         # Add residual and normalize
         x = self.layer_norm(x + x_spatial)
@@ -121,8 +122,13 @@ class STGNNMixer(nn.Module):
         topk_values, topk_indices = torch.topk(learned_adj, k=self.top_k, dim=1)
         mask = torch.zeros_like(learned_adj).scatter_(1, topk_indices, 1.0)
         
+        # Blending static business rules with learned insights.
+        # graph_alpha is a trainable parameter.
+        # If the optimizer increases alpha, it favors your hierarchy. 
+        # If it decreases alpha, it favors discovered product correlations
         learned_adj = F.softmax(learned_adj * mask, dim=1)
         combined_adj = (self.graph_alpha * adj) + ((1 - self.graph_alpha) * learned_adj)
+        combined_adj = F.normalize(combined_adj, p=1, dim=1)
         
         for block in self.blocks:
             x = block(x, combined_adj)
@@ -208,6 +214,49 @@ class LitSTGNNMixer(pl.LightningModule):
         loss = F.l1_loss(y_hat, y)
         self.log('val_loss', loss, prog_bar=True)
         return loss
+    
+    def test_step(self, batch, _batch_idx):
+        x, y_hist, x_future, y = batch
+        
+        mean = y_hist.mean(dim=-1, keepdim=True)
+        std = y_hist.std(dim=-1, keepdim=True) + 1e-5
+        
+        y_hat_norm = self(x, x_future)
+        y_hat = (y_hat_norm * std) + mean
+        
+        # Calculate loss against the RAW target
+        loss = F.l1_loss(y_hat, y)
+        self.log('test_loss', loss, prog_bar=True)
+        return loss
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+    
+    def on_train_epoch_end(self):
+        # Access the alpha from the core model
+        # .item() converts the 1-element tensor to a regular Python float
+        alpha_val = self.model.graph_alpha.item()
+        
+        print(f"\n--- Epoch {self.current_epoch} End ---")
+        print(f"Graph Alpha (Business vs. Latent): {alpha_val:.4f}")
+        
+        # Interpret the result for your research log
+        if alpha_val > 0.5:
+            print("Status: Model is leaning on your Supply Chain Hierarchy.")
+        else:
+            print("Status: Model is leaning on Discovered Latent Relationships.")
+        
+        # Also log it so it shows up in your progress bar/tensorboard
+        self.log("graph_alpha", alpha_val, prog_bar=True)
+
+        # 2. Extract Top-K Learned Connections
+        # We look at the learned adjacency matrix from the model
+        with torch.no_grad():
+            # Recompute learned_adj just for the printout
+            learned_adj = torch.matmul(self.model.node_emb, self.model.node_emb.transpose(0, 1))
+            learned_adj = F.relu(learned_adj)
+            
+            # Let's look at the first 3 products as a sample
+            for i in range(min(3, self.model.n_nodes)):
+                weights, indices = torch.topk(learned_adj[i], k=5)
+                print(f"SKU {i} Strongest Learned Links: Nodes {indices.tolist()} (Weights: {weights.tolist()})")

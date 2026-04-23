@@ -63,8 +63,8 @@ def load_sales_data(download_m5_data: str, config: SalesDataConfig) -> tuple:
     # sales_train_eval_df= pd.read_csv(sales_train_eval_path)
 
     if config.downsample_dataset:
-        # reduce to only Foods and CA
-        sales_train_df = sales_train_df.query("cat_id == 'FOODS' & store_id == 'CA_1' ").head(100)
+        # reduce to only Foods and TX of first 100 per dept, per store
+        sales_train_df = sales_train_df.query("cat_id == 'FOODS'  & dept_id == 'FOODS_1' & state_id == 'TX'")
 
         print("Number of selected items in evaluation set:", len(sales_train_df))
 
@@ -148,7 +148,7 @@ def feature_engineering() -> pd.DataFrame:
     #----------------------------------
     # Lag feature for sales
     #----------------------------------
-    for lag_horizon in [1, 2, 3, 7, 14]:
+    for lag_horizon in [28, 35, 42, 49, 56]:
         feature_name = f"sales_lag_{lag_horizon}"
         raw_feature_sales[feature_name] = raw_feature_sales.groupby(["id", "item_id", "store_id"])["sales"].shift(lag_horizon)
         feature_list.append(feature_name)
@@ -158,7 +158,7 @@ def feature_engineering() -> pd.DataFrame:
     #----------------------------------
     for win_day in [7, 14, 28, 84]:
         # Create the grouped rolling object ONCE per window size and avoid data leakage
-        rolling_obj = raw_feature_sales.groupby(["id", "item_id", "store_id"])["sales_lag_1"].rolling(window=win_day)
+        rolling_obj = raw_feature_sales.groupby(["id", "item_id", "store_id"])["sales_lag_28"].rolling(window=win_day)
 
         # Calculate the native C-optimized metrics. 
         # groupby.rolling() creates a MultiIndex, so we drop the grouping levels to map it cleanly back to the original rows.
@@ -320,8 +320,21 @@ def prepare_ml_data() -> None:
     # Fill feature NaNs with 0 before scaling to keep the matrix intact
     df[continuous_features] = df[continuous_features].fillna(0)
 
+    # Find the cutoff date so we don't leak test data stats into the scaler
+    pred_len = 28
+    all_dates = sorted(df["ds"].unique())
+    test_start_date = all_dates[-pred_len]
+    
+    # Create a mask for the training data
+    train_mask = df["ds"] < test_start_date
+
     scaler = StandardScaler()
-    df[continuous_features] = scaler.fit_transform(df[continuous_features])
+    
+    # FIT the scaler ONLY on the training data!
+    scaler.fit(df.loc[train_mask, continuous_features])
+    
+    # TRANSFORM the entire dataframe using the training stats
+    df[continuous_features] = scaler.transform(df[continuous_features])
 
     if np.isnan(df[continuous_features].values).any() or np.isinf(df[continuous_features].values).any():
         raise ValueError("CRITICAL: df contains NaNs or Infs! Check your upstream scaling.")
@@ -818,13 +831,13 @@ def evaluate_benchmark() -> None:
     test_df = df[df["ds"] >= test_start_date].copy()
     
     # 2. Load the Baseline Predictions
-    stats_preds = pd.read_parquet(os.path.join(pred_dir, "stats_predictions.parquet"))
+    # stats_preds = pd.read_parquet(os.path.join(pred_dir, "stats_predictions.parquet"))
     deep_preds = pd.read_parquet(os.path.join(pred_dir, "deep_predictions.parquet"))
     lgb_preds = pd.read_parquet(os.path.join(pred_dir, "lgb_predictions.parquet"))
     
     # Merge them into a single dataframe
-    all_preds = stats_preds.merge(deep_preds, on=["unique_id", "ds"], how="inner")
-    all_preds = all_preds.merge(lgb_preds, on=["unique_id", "ds"], how="inner")
+    # all_preds = stats_preds.merge(deep_preds, on=["unique_id", "ds"], how="inner")
+    all_preds = deep_preds.merge(lgb_preds, on=["unique_id", "ds"], how="inner")
     
     # ---------------------------------------------------------
     # 3. Generate STGNN Predictions (Full + Ablations)
@@ -935,6 +948,10 @@ def evaluate_benchmark() -> None:
         all_preds = all_preds.merge(vanilla_preds, on=["unique_id", "ds"], how="inner")
     else:
         print("Skipping VanillaSTGNN because weights were not found.")
+
+    # Force all prediction columns to be 0 or higher
+    model_cols = [col for col in all_preds.columns if col not in ['unique_id', 'ds', 'y']]
+    all_preds[model_cols] = all_preds[model_cols].clip(lower=0.0)
 
     # ---------------------------------------------------------
     # 4. Calculate Final Metrics

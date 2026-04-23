@@ -105,7 +105,10 @@ class STGNNMixer(nn.Module):
         self.futr_projection = nn.Linear(n_futr_features, hidden_features)
 
         # The final head now accepts (Historical Graph Memory) + (Future Info)
-        self.head = nn.Linear((seq_len * hidden_features) + (pred_len * hidden_features), pred_len)
+        self.head = nn.Sequential(
+            nn.Linear((seq_len * hidden_features) + (pred_len * hidden_features), pred_len),
+            nn.ReLU() # Stop negative predictions at the source!
+        )
         
 
     def forward(self, x, x_future, adj):
@@ -150,7 +153,9 @@ class STGNNMixer(nn.Module):
             topk_values, topk_indices = torch.topk(dynamic_adj, k=self.top_k, dim=2)
             mask = torch.zeros_like(dynamic_adj).scatter_(2, topk_indices, 1.0)
             
-            dynamic_adj = F.softmax(dynamic_adj * mask, dim=2)
+            # THE FIX: Replace zeros with -infinity before the softmax!
+            dynamic_adj = dynamic_adj.masked_fill(mask == 0, float('-inf'))
+            dynamic_adj = F.softmax(dynamic_adj, dim=2)
             
             # F. Blend with static business rules
             static_adj_batch = adj.unsqueeze(0).repeat(B, 1, 1)
@@ -344,7 +349,10 @@ class VanillaSTGNN(nn.Module):
         ])
         
         # 3. Output Projection to get the 28-day forecast
-        self.out_proj = nn.Linear(hidden_features, pred_len)
+        self.out_proj = nn.Sequential(
+            nn.Linear(hidden_features, pred_len),
+            nn.ReLU()
+        )
 
     def forward(self, x, x_future, adj):
         # Extract the batch size

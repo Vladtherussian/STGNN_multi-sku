@@ -28,34 +28,33 @@ class GraphMixerBlock(nn.Module):
         self.layer_norm = nn.LayerNorm(n_features)
 
     def forward(self, x, adj):
-        # x shape: [Batch_size, Num_nodes, Seq_len, Features]
+        # x shape: [B, N, S, Feat]
         B, N, S, Feat = x.shape
         
         # --- Temporal Mixing ---
-        # Reshape to mix across the sequence length (time)
-        x_temp = x.permute(0, 1, 3, 2) # [B, N, Feat, S]
+        x_temp = x.permute(0, 1, 3, 2)
         x_temp = self.temporal_mlp(x_temp)
-        x_temp = x_temp.permute(0, 1, 3, 2) # Back to [B, N, S, Feat]
-        
-        # Add residual connection
+        x_temp = x_temp.permute(0, 1, 3, 2)
         x = x + x_temp
         
-        # --- Spatial Mixing (Optimized Parallel Graph Convolution) ---
-        # 1. Swap Seq_len and Nodes -> [Batch, Seq_len, Nodes, Features]
-        x_reshaped = x.permute(0, 2, 1, 3) 
+        # --- Spatial Mixing (The VRAM Saver) ---
+        # 1. Apply the linear projection directly to x
+        x_proj = self.spatial_gcn.lin(x) # -> [B, N, S, Feat]
         
-        # 2. Flatten Batch and Seq_len into one massive effective batch
-        # Shape becomes: [(Batch * Seq_len), Nodes, Features]
-        x_flat = x_reshaped.reshape(B * S, N, Feat)
+        # 2. Smash Time and Features together
+        # Shape goes from [B, N, S, Feat] -> [B, N, S * Feat]
+        x_proj_flat = x_proj.flatten(start_dim=2)
         
-        # 3. Apply the Graph Convolution ONCE across all time steps simultaneously!
-        # PyTorch automatically broadcasts your [N, N] adjacency matrix across the new batch size.
-        gcn_out = self.spatial_gcn(x_flat, adj) 
+        # 3. Batch Matrix Multiply! (No broadcasting required)
+        x_spatial_flat = torch.bmm(adj, x_proj_flat)
         
-        # 4. Unflatten back to the original dimensions
-        # View separates the Batch and Time, Permute puts Nodes back in the right spot
-        x_spatial = gcn_out.view(B, S, N, Feat).permute(0, 2, 1, 3) # -> [B, N, S, Feat]
+        # 4. Un-smash back to normal dimensions
+        x_spatial = x_spatial_flat.view(B, N, S, Feat)
         
+        # 5. Add the bias (if it exists)
+        if getattr(self.spatial_gcn, 'bias', None) is not None:
+            x_spatial = x_spatial + self.spatial_gcn.bias
+            
         # Add residual and normalize
         x = self.layer_norm(x + x_spatial)
         
@@ -66,12 +65,12 @@ class STGNNMixer(nn.Module):
     Upgraded architecture featuring Local Instance Normalization 
     and Top-K Graph Sparsification.
     """
-    def __init__(self, seq_len, pred_len, n_nodes, in_features, hidden_features, n_futr_features, n_blocks=3, top_k=10, ablation_mode="full"):
+    def __init__(self, seq_len, pred_len, n_nodes, in_features, hidden_features, n_futr_features, n_blocks=3, top_k=5, ablation_mode="full"):
         super().__init__()
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.n_nodes = n_nodes
-        self.top_k = top_k # Restrict the graph to the top 10 strongest connections
+        self.top_k = top_k # Restrict the graph to the top 3 strongest connections
         self.ablation_mode = ablation_mode # "full", "static_graph", or "no_graph"
         
         # Trainable identities
@@ -89,6 +88,13 @@ class STGNNMixer(nn.Module):
         
         self.feature_projection = nn.Linear(in_features, hidden_features)
         
+        # Instead of static node_emb, we will generate the graph dynamically
+        self.query_proj = nn.Linear(hidden_features, hidden_features)
+        self.key_proj = nn.Linear(hidden_features, hidden_features)
+        
+        # We can keep the static node embedding as a baseline "identity" for each node
+        self.static_node_emb = nn.Parameter(torch.randn(n_nodes, hidden_features))
+        
         # We increased default blocks to 3 for deeper learning
         self.blocks = nn.ModuleList([
             GraphMixerBlock(seq_len=seq_len, n_features=hidden_features) 
@@ -105,57 +111,63 @@ class STGNNMixer(nn.Module):
     def forward(self, x, x_future, adj):
         B, N, S, Feat = x.shape
         
-        # ---------------------------------------------------------
-        # 1. Local Normalization (Crucial for Time Series)
-        # ---------------------------------------------------------
-        # InstanceNorm1d expects [Batch, Features, Time]. We reshape, normalize, and revert.
+        # 1. Local Normalization
         x_norm = x.view(B * N, S, Feat).permute(0, 2, 1) 
         x_norm = self.instance_norm(x_norm)
         x = x_norm.permute(0, 2, 1).view(B, N, S, Feat)
         
-        # 2. Project features & add embeddings
+        # 2. Project features & add baseline static embeddings
         x = self.feature_projection(x) 
-        x = x + self.node_emb.view(1, N, 1, -1)
+        x = x + self.static_node_emb.view(1, N, 1, -1)
         
         # ---------------------------------------------------------
-        # 3. Top-K Sparsified Adaptive Graph
+        # 3. THE DYNAMIC GRAPH (Context-Aware Routing)
         # ---------------------------------------------------------
         if self.ablation_mode == "no_graph":
-            # ABLATION 1: Identity Matrix. Nodes only talk to themselves.
-            combined_adj = torch.eye(N, device=x.device)
+            combined_adj = torch.eye(N, device=x.device).unsqueeze(0).repeat(B, 1, 1)
             
         elif self.ablation_mode == "static_graph":
-            # ABLATION 2: Only use the hardcoded Walmart hierarchy
-            combined_adj = F.normalize(adj, p=1, dim=1)
+            combined_adj = F.normalize(adj, p=1, dim=1).unsqueeze(0).repeat(B, 1, 1)
             
-        else: # "full"
-            # FULL MODEL: Blend static rules with discovered latent correlations
-            learned_adj = torch.matmul(self.node_emb, self.node_emb.transpose(0, 1))
-            learned_adj = F.relu(learned_adj)
+        else: # "full" (Now completely dynamic!)
+            # A. Summarize the 56-day history into a single context vector per node
+            # Shape: [Batch, Nodes, Hidden]
+            x_context = x.mean(dim=2) 
             
-            # Force sparsity. Find the top K connections for each node.
-            # This prevents over-smoothing and creates sharp, interpretable edges.
-            topk_values, topk_indices = torch.topk(learned_adj, k=self.top_k, dim=1)
-            mask = torch.zeros_like(learned_adj).scatter_(1, topk_indices, 1.0)
+            # B. Generate Queries and Keys
+            Q = self.query_proj(x_context) # [B, N, Hidden]
+            K = self.key_proj(x_context)   # [B, N, Hidden]
             
-            # Blending static business rules with learned insights.
-            # graph_alpha is a trainable parameter.
-            # If the optimizer increases alpha, it favors your hierarchy. 
-            # If it decreases alpha, it favors discovered product correlations
-            learned_adj = F.softmax(learned_adj * mask, dim=1)
-            combined_adj = (self.graph_alpha * adj) + ((1 - self.graph_alpha) * learned_adj)
-            combined_adj = F.normalize(combined_adj, p=1, dim=1)
-        
+            # C. Compute dynamic connection strength: Q * K^T
+            # Shape: [B, N, N]
+            dynamic_adj = torch.bmm(Q, K.transpose(1, 2))
+            
+            # D. Scale to prevent exploding gradients (standard attention mechanism)
+            dynamic_adj = dynamic_adj / (Q.shape[-1] ** 0.5)
+            dynamic_adj = F.relu(dynamic_adj)
+            
+            # E. Top-K Sparsification (Applied per batch!)
+            topk_values, topk_indices = torch.topk(dynamic_adj, k=self.top_k, dim=2)
+            mask = torch.zeros_like(dynamic_adj).scatter_(2, topk_indices, 1.0)
+            
+            dynamic_adj = F.softmax(dynamic_adj * mask, dim=2)
+            
+            # F. Blend with static business rules
+            static_adj_batch = adj.unsqueeze(0).repeat(B, 1, 1)
+            combined_adj = (self.graph_alpha * static_adj_batch) + ((1 - self.graph_alpha) * dynamic_adj)
+            combined_adj = F.normalize(combined_adj, p=1, dim=2)
+
+        # 4. Message Passing
         for block in self.blocks:
             x = block(x, combined_adj)
             
-        x_hist_flat = x.reshape(B, N, S * x.shape[-1]) # [Batch, Nodes, 56 * Hidden]
+        x_hist_flat = x.reshape(B, N, S * x.shape[-1])
         
-        # NEW: Process Future Covariates
-        x_futr_proj = self.futr_projection(x_future)   # [Batch, Nodes, 28, Hidden]
-        x_futr_flat = x_futr_proj.reshape(B, N, -1)    # [Batch, Nodes, 28 * Hidden]
+        # 5. Process Future Covariates
+        x_futr_proj = self.futr_projection(x_future)
+        x_futr_flat = x_futr_proj.reshape(B, N, -1)
         
-        # Concatenate History and Future, then predict!
+        # 6. Predict
         combined = torch.cat([x_hist_flat, x_futr_flat], dim=2)
         out = self.head(combined) 
         return out
@@ -249,30 +261,115 @@ class LitSTGNNMixer(pl.LightningModule):
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
     
     def on_train_epoch_end(self):
-        # Access the alpha from the core model
-        # .item() converts the 1-element tensor to a regular Python float
-        alpha_val = self.model.graph_alpha.item()
-        
-        print(f"\n--- Epoch {self.current_epoch} End ---")
-        print(f"Graph Alpha (Business vs. Latent): {alpha_val:.4f}")
-        
-        # Interpret the result for your research log
-        if alpha_val > 0.5:
-            print("Status: Model is leaning on your Supply Chain Hierarchy.")
-        else:
-            print("Status: Model is leaning on Discovered Latent Relationships.")
-        
-        # Also log it so it shows up in your progress bar/tensorboard
-        self.log("graph_alpha", alpha_val, prog_bar=True)
-
-        # 2. Extract Top-K Learned Connections
-        # We look at the learned adjacency matrix from the model
-        with torch.no_grad():
-            # Recompute learned_adj just for the printout
-            learned_adj = torch.matmul(self.model.node_emb, self.model.node_emb.transpose(0, 1))
-            learned_adj = F.relu(learned_adj)
+        # 1. Log Graph Alpha (Only if the core model has it!)
+        if hasattr(self.model, 'graph_alpha'):
+            alpha_val = self.model.graph_alpha.item()
             
-            # Let's look at the first 3 products as a sample
-            for i in range(min(3, self.model.n_nodes)):
-                weights, indices = torch.topk(learned_adj[i], k=5)
-                print(f"SKU {i} Strongest Learned Links: Nodes {indices.tolist()} (Weights: {weights.tolist()})")
+            print(f"\n--- Epoch {self.current_epoch} End ---")
+            print(f"Graph Alpha (Business vs. Latent): {alpha_val:.4f}")
+            
+            if alpha_val > 0.5:
+                print("Status: Model is leaning on your Supply Chain Hierarchy.")
+            else:
+                print("Status: Model is leaning on Discovered Latent Relationships.")
+            
+            self.log("graph_alpha", alpha_val, prog_bar=True)
+
+        # 2. Extract Top-K Learned Connections (Only if the model has dynamic node embeddings!)
+        if hasattr(self.model, 'node_emb'):
+            with torch.no_grad():
+                learned_adj = torch.matmul(self.model.node_emb, self.model.node_emb.transpose(0, 1))
+                learned_adj = F.relu(learned_adj)
+                
+                for i in range(min(3, self.model.n_nodes)):
+                    weights, indices = torch.topk(learned_adj[i], k=5)
+                    print(f"SKU {i} Strongest Learned Links: Nodes {indices.tolist()} (Weights: {weights.tolist()})")
+
+class VanillaSTGNNBlock(nn.Module):
+    """
+    A classic Spatio-Temporal block using a GRU for time and GCN for space.
+    """
+    def __init__(self, n_features):
+        super().__init__()
+        
+        # 1. Classic Temporal Processing (Recurrent Neural Network)
+        self.temporal_gru = nn.GRU(
+            input_size=n_features, 
+            hidden_size=n_features, 
+            batch_first=True
+        )
+        
+        # 2. Classic Spatial Processing
+        self.spatial_gcn = DenseGCNConv(in_channels=n_features, out_channels=n_features)
+        
+        self.layer_norm = nn.LayerNorm(n_features)
+
+    def forward(self, x, adj):
+        # x shape: [B, N, S, Feat]
+        B, N, S, _ = x.shape
+        
+        # --- Temporal Processing (GRU) ---
+        x_reshaped = x.view(B * N, S, -1)
+        x_temp, _ = self.temporal_gru(x_reshaped) 
+        x_temp = x_temp.view(B, N, S, -1)
+        
+        # --- Spatial Processing (GCN) ---
+        x_proj = self.spatial_gcn.lin(x_temp)
+        
+        # The VRAM Saver
+        x_proj_flat = x_proj.flatten(start_dim=2)
+        x_spatial_flat = torch.bmm(adj, x_proj_flat)
+        x_spatial = x_spatial_flat.view(B, N, S, -1)
+        
+        if getattr(self.spatial_gcn, 'bias', None) is not None:
+            x_spatial = x_spatial + self.spatial_gcn.bias
+            
+        # Add residual and normalize
+        x_out = self.layer_norm(x + x_spatial)
+        return x_out
+
+
+class VanillaSTGNN(nn.Module):
+    """The full model wrapper for the Vanilla baseline."""
+    def __init__(self, seq_len, pred_len, n_nodes, in_features, hidden_features, n_blocks):
+        super().__init__()
+        
+        # 1. Feature Projection
+        self.input_proj = nn.Linear(in_features, hidden_features)
+        
+        # 2. The Deep Layers (Using the Vanilla GRU blocks defined right above!)
+        self.blocks = nn.ModuleList([
+            VanillaSTGNNBlock(n_features=hidden_features) 
+            for _ in range(n_blocks)
+        ])
+        
+        # 3. Output Projection to get the 28-day forecast
+        self.out_proj = nn.Linear(hidden_features, pred_len)
+
+    def forward(self, x, x_future, adj):
+        # Extract the batch size
+        B = x.shape[0]
+        
+        # Project inputs
+        x = self.input_proj(x)
+        
+        # ---------------------------------------------------------
+        # THE FIX: Format the Adjacency Matrix
+        # ---------------------------------------------------------
+        # 1. Normalize it so node features don't explode during Message Passing
+        import torch.nn.functional as F
+        adj_norm = F.normalize(adj, p=1, dim=1)
+        
+        # 2. Add the Batch dimension so it becomes [B, N, N] (e.g., [8, 1000, 1000])
+        adj_batched = adj_norm.unsqueeze(0).repeat(B, 1, 1)
+        
+        # Pass through the GRU/GCN blocks using the properly batched matrix
+        for block in self.blocks:
+            x = block(x, adj_batched)
+            
+        # We take the final time step from the GRU sequence to make the prediction
+        x_final = x[:, :, -1, :] 
+        
+        # Project to the 28-day forecast horizon
+        out = self.out_proj(x_final)
+        return out

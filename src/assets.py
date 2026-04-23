@@ -11,7 +11,7 @@ import numpy as np
 from dagster import asset, Config
 
 
-
+from .hybrid_model import VanillaSTGNN, VanillaSTGNNBlock
 from pathlib import Path
 
 # __file__ points to assets.py. 
@@ -54,30 +54,26 @@ def load_sales_data(download_m5_data: str, config: SalesDataConfig) -> tuple:
     # download_m5_data automatically contains the 'raw_data_dir' string
     prices_path = os.path.join(download_m5_data, "sell_prices.csv")
     calendar_path = os.path.join(download_m5_data, "calendar.csv")
-    # sales_train_path = os.path.join(download_m5_data, "sales_train_validation.csv")
-    sales_train_eval_path = os.path.join(download_m5_data, "sales_train_evaluation.csv")
+    sales_train_path = os.path.join(download_m5_data, "sales_train_validation.csv")
+    # sales_train_eval_path = os.path.join(download_m5_data, "sales_train_evaluation.csv")
 
     prices_df= pd.read_csv(prices_path)
     calendar_df= pd.read_csv(calendar_path)
-    # sales_train_df= pd.read_csv(sales_train_path)
-    sales_train_eval_df= pd.read_csv(sales_train_eval_path)
+    sales_train_df= pd.read_csv(sales_train_path)
+    # sales_train_eval_df= pd.read_csv(sales_train_eval_path)
 
     if config.downsample_dataset:
-        # Find the top 200 highest volume items dynamically
-        sales_col = sales_train_eval_df.columns[sales_train_eval_df.columns.str.startswith("d_")] # Identify the sales columns
-        sales_train_eval_df["total_sales"] = sales_train_eval_df[sales_col].sum(axis=1) # Sum across all days to get total sales per item
-        sales_train_eval_df = sales_train_eval_df.sort_values("total_sales", ascending=False) # Sort by total sales
-        sales_train_eval_df = sales_train_eval_df.head(1000) # Keep only the top 200 items
-        sales_train_eval_df.drop(columns=["total_sales"], inplace=True) # Drop the helper column
+        # reduce to only Foods and CA
+        sales_train_df = sales_train_df.query("cat_id == 'FOODS' & store_id == 'CA_1' ").head(100)
 
-        print("Number of selected items in evaluation set:", len(sales_train_eval_df))
+        print("Number of selected items in evaluation set:", len(sales_train_df))
 
-    return prices_df, calendar_df, sales_train_eval_df
+    return prices_df, calendar_df, sales_train_df
 
 @asset(deps=["load_sales_data"])
 def process_raw_data(load_sales_data: tuple) -> None:
     """Processes the raw data into a single dataframe."""
-    prices_df, calendar_df, sales_train_eval_df = load_sales_data
+    prices_df, calendar_df, sales_train_df = load_sales_data
 
     #----------------------------------
     # Process Calendar Data
@@ -116,7 +112,7 @@ def process_raw_data(load_sales_data: tuple) -> None:
     # Process Sales Data
     #----------------------------------
     cleaned_sales = pd.melt(
-        sales_train_eval_df,
+        sales_train_df,
         var_name="day",
         value_name="sales",
         id_vars=["id", "item_id", "dept_id", "cat_id", "store_id", "state_id"],
@@ -406,6 +402,55 @@ def prepare_stgnn_tensors() -> None:
     print(f"Successfully built Tensors: X {X_tensor.shape}, adj {adj_tensor.shape}")
     print(f"Saved payload to {tensor_path}")
 
+@asset(deps=["prepare_ml_data"])
+def train_lightgbm_baseline() -> None:
+    """Trains the Kaggle-winning LightGBM baseline."""
+    import lightgbm as lgb
+    import pandas as pd
+    import os
+    
+    processed_dir = os.path.join(os.getcwd(), "data", "processed")
+    df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
+    
+    pred_len = 28
+    all_dates = sorted(df["ds"].unique())
+    test_start_date = all_dates[-pred_len]
+    
+    # Separate features from targets and identifiers
+    drop_cols = ['unique_id', 'ds', 'y']
+    features = [col for col in df.columns if col not in drop_cols]
+    
+    df_train = df[df["ds"] < test_start_date].copy()
+    df_test = df[df["ds"] >= test_start_date].copy()
+    
+    X_train, y_train = df_train[features], df_train['y']
+    X_test = df_test[features]
+    
+    print("Igniting LightGBM Baseline (Global Model)...")
+    model = lgb.LGBMRegressor(
+        objective='tweedie',
+        tweedie_variance_power=1.5,
+        n_estimators=500,        # Number of boosting rounds
+        learning_rate=0.05,      # Step size
+        num_leaves=63,           # Allows for complex feature interactions
+        n_jobs=-1,               # Blast this across all your CPU cores!
+        random_state=42,
+        verbose=-1
+    )
+    
+    # Train the model
+    model.fit(X_train, y_train)
+    
+    # Generate predictions
+    predictions = df_test[['unique_id', 'ds']].copy()
+    predictions['LightGBM'] = model.predict(X_test)
+    
+    # Save for the leaderboard
+    out_dir = os.path.join(os.getcwd(), "data", "predictions")
+    os.makedirs(out_dir, exist_ok=True)
+    predictions.to_parquet(os.path.join(out_dir, "lgb_predictions.parquet"), index=False)
+    print("LightGBM baseline predictions saved.")
+
 
 @asset(deps=["prepare_stgnn_tensors"])
 def train_hybrid_stgnn() -> None:
@@ -491,6 +536,83 @@ def train_hybrid_stgnn() -> None:
     torch.save(lit_model.state_dict(), os.path.join(model_dir, "weights.pt"))
     print(f"STGNNMixer explicitly trained and saved to {model_dir}")
 
+
+@asset(deps=["prepare_stgnn_tensors"])
+def train_vanilla_stgnn() -> None:
+    """Trains the Vanilla STGNN baseline to compare against the Mixer."""
+    import torch
+    import pytorch_lightning as pl
+    from pytorch_lightning.callbacks import EarlyStopping
+    from torch.utils.data import DataLoader
+    import os
+    
+    # NEW: Importing the FULL model (VanillaSTGNN) and your Dataset
+    from .hybrid_model import VanillaSTGNN, LitSTGNNMixer, GraphTimeSeriesDataset
+
+    # 1. Load the payload
+    processed_dir = os.path.join(os.getcwd(), "data", "processed")
+    payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
+    X, y, adj = payload["X"], payload["y"], payload["adj"]
+    n_nodes, n_features = payload["n_nodes"], payload["n_features"]
+    futr_indices = payload["futr_indices"]
+
+    # 2. Hyperparameters
+    seq_len = 56   
+    pred_len = 28  
+    hidden_features = 128
+    batch_size = 32
+
+    # 3. Temporal Train/Validation Split
+    test_start_idx = X.shape[1] - pred_len
+    val_start_idx = test_start_idx - pred_len
+    
+    X_train, y_train = X[:, :val_start_idx, :], y[:, :val_start_idx]
+    X_val = X[:, val_start_idx - seq_len : test_start_idx, :]
+    y_val = y[:, val_start_idx - seq_len : test_start_idx]
+
+    # 4. Initialize DataLoaders
+    train_dataset = GraphTimeSeriesDataset(X_train, y_train, seq_len, pred_len, futr_indices)
+    val_dataset = GraphTimeSeriesDataset(X_val, y_val, seq_len, pred_len, futr_indices)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+    # 5. Instantiate the FULL Vanilla Model (The "House")
+    core_vanilla_model = VanillaSTGNN(
+        seq_len=seq_len,
+        pred_len=pred_len,
+        n_nodes=n_nodes,
+        in_features=n_features,  
+        hidden_features=hidden_features,
+        n_blocks=3               
+    )
+
+    # Wrap it in PyTorch Lightning
+    vanilla_model = LitSTGNNMixer(
+        model=core_vanilla_model, 
+        adj_matrix=adj, 
+        learning_rate=1e-3
+    )
+    
+    # 6. Train it
+    early_stop_callback = EarlyStopping(monitor="val_loss", patience=3, mode="min")
+    trainer = pl.Trainer(
+        max_epochs=100,
+        callbacks=[early_stop_callback],
+        accelerator="auto",
+        precision="16-mixed"
+    )
+    
+    print(f"Igniting Vanilla STGNN Baseline on {n_nodes} nodes...")
+    trainer.fit(vanilla_model, train_loader, val_loader)
+    
+    # 7. Save the weights
+    model_dir = os.path.join(os.getcwd(), "data", "models", "vanilla_stgnn")
+    os.makedirs(model_dir, exist_ok=True)
+    torch.save(vanilla_model.state_dict(), os.path.join(model_dir, "weights.pt"))
+    print(f"Vanilla STGNN explicitly trained and saved to {model_dir}")
+
+
 @asset(deps=["prepare_stgnn_tensors"])
 def train_ablation_no_graph() -> None:
     """Ablation 1: STGNN with Spatial Routing completely disabled (Identity Matrix)."""
@@ -543,6 +665,7 @@ def train_ablation_no_graph() -> None:
     out_dir = os.path.join(os.getcwd(), "data", "models", "ablation_no_graph")
     os.makedirs(out_dir, exist_ok=True)
     torch.save(lit_model.state_dict(), os.path.join(out_dir, "weights.pt"))
+
 
 @asset(deps=["prepare_stgnn_tensors"])
 def train_ablation_static_graph() -> None:
@@ -608,7 +731,7 @@ def train_statistical_baselines() -> None:
     df_train = df[df["ds"] < test_start_date][['unique_id', 'ds', 'y']].copy()
     
     # Season length 7 captures weekly retail cycles
-    models = [AutoARIMA(season_length=7), AutoETS(season_length=7)]
+    models = [AutoARIMA(season_length=7, stepwise=True, approximation=True), AutoETS(season_length=7)]
     
     sf = StatsForecast(models=models, freq='D', n_jobs=-1)
     
@@ -671,7 +794,9 @@ def train_deep_baselines() -> None:
     "train_deep_baselines", 
     "train_hybrid_stgnn", 
     "train_ablation_no_graph", 
-    "train_ablation_static_graph"
+    "train_ablation_static_graph",
+    "train_vanilla_stgnn",
+    "train_lightgbm_baseline"
 ])
 def evaluate_benchmark() -> None:
     import pandas as pd
@@ -695,9 +820,11 @@ def evaluate_benchmark() -> None:
     # 2. Load the Baseline Predictions
     stats_preds = pd.read_parquet(os.path.join(pred_dir, "stats_predictions.parquet"))
     deep_preds = pd.read_parquet(os.path.join(pred_dir, "deep_predictions.parquet"))
+    lgb_preds = pd.read_parquet(os.path.join(pred_dir, "lgb_predictions.parquet"))
     
     # Merge them into a single dataframe
     all_preds = stats_preds.merge(deep_preds, on=["unique_id", "ds"], how="inner")
+    all_preds = all_preds.merge(lgb_preds, on=["unique_id", "ds"], how="inner")
     
     # ---------------------------------------------------------
     # 3. Generate STGNN Predictions (Full + Ablations)
@@ -762,13 +889,61 @@ def evaluate_benchmark() -> None:
         stgnn_preds = pd.DataFrame(stgnn_records)
         all_preds = all_preds.merge(stgnn_preds, on=["unique_id", "ds"], how="inner")
 
+    # =========================================================
+    # Evaluate Vanilla STGNN Baseline
+    # =========================================================
+    vanilla_weights_path = os.path.join(os.getcwd(), "data", "models", "vanilla_stgnn", "weights.pt")
+    
+    if os.path.exists(vanilla_weights_path):
+        print("Evaluating Vanilla STGNN Baseline...")
+        vanilla_state_dict = torch.load(vanilla_weights_path)
+        
+        # Instantiate the "House"
+        core_vanilla = VanillaSTGNN(
+            seq_len=seq_len, 
+            pred_len=pred_len, 
+            n_nodes=n_nodes, 
+            in_features=n_features, 
+            hidden_features=128,  # Same as we trained it with
+            n_blocks=3
+        )
+        
+        # Wrap it in Lightning and load the weights
+        lit_vanilla = LitSTGNNMixer(model=core_vanilla, adj_matrix=adj.to(device))
+        lit_vanilla.load_state_dict(vanilla_state_dict)
+        lit_vanilla.to(device)
+        lit_vanilla.eval()
+        
+        with torch.no_grad():
+            mean = y_hist.mean(dim=-1, keepdim=True)
+            std = y_hist.std(dim=-1, keepdim=True) + 1e-5
+            y_hat_norm = lit_vanilla(x_hist, x_future)
+            # Denormalize
+            y_hat = (y_hat_norm * std) + mean
+            
+        y_hat_cpu = y_hat.squeeze(0).cpu().numpy()
+        
+        # Format the predictions into a DataFrame
+        vanilla_records = []
+        for i, uid in enumerate(ordered_unique_ids):
+            for j, date in enumerate(test_dates):
+                vanilla_records.append({"unique_id": uid, "ds": date, "VanillaSTGNN": y_hat_cpu[i, j]})
+                
+        vanilla_preds = pd.DataFrame(vanilla_records)
+        
+        # Merge it into the master predictions dataframe
+        all_preds = all_preds.merge(vanilla_preds, on=["unique_id", "ds"], how="inner")
+    else:
+        print("Skipping VanillaSTGNN because weights were not found.")
+
     # ---------------------------------------------------------
     # 4. Calculate Final Metrics
     # ---------------------------------------------------------
     print("\nCalculating rigorous M5 validation metrics...")
     
     # Update the names list to include your ablations
-    model_names = ["AutoARIMA", "AutoETS", "TSMixerx", "TFT", "NHITS", "STGNNMixer", "STGNN_StaticGraph", "STGNN_NoGraph"]
+    model_names = ["AutoARIMA", "AutoETS", "TSMixerx", "TFT", "NHITS", "STGNNMixer", 
+                   "STGNN_StaticGraph", "STGNN_NoGraph", "VanillaSTGNN", "LightGBM"]
     
     # Filter the list down to models that actually exist in the dataframe
     model_names = [m for m in model_names if m in all_preds.columns]
@@ -792,69 +967,69 @@ def evaluate_benchmark() -> None:
     all_preds.to_parquet(final_pred_path, index=False)
     print(f"Master predictions file saved for visualization: {final_pred_path}")
 
-# @asset(deps=["prepare_ml_data"])
-# def train_tsmixerx() -> None:
-#     from neuralforecast import NeuralForecast
-#     from neuralforecast.models import TSMixerx
-#     import pandas as pd
-#     import os
+@asset(deps=["prepare_ml_data"])
+def train_tsmixerx() -> None:
+    from neuralforecast import NeuralForecast
+    from neuralforecast.models import TSMixerx
+    import pandas as pd
+    import os
     
-#     processed_dir = os.path.join(os.getcwd(), "data", "processed")
-#     df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
+    processed_dir = os.path.join(os.getcwd(), "data", "processed")
+    df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
     
-#     n_series = df["unique_id"].nunique()
-#     pred_len = 28
+    n_series = df["unique_id"].nunique()
+    pred_len = 28
     
-#     # NEW: Split the dataframe by Date to match the STGNN tensors
-#     all_dates = sorted(df["ds"].unique())
-#     test_start_date = all_dates[-pred_len]
+    # NEW: Split the dataframe by Date to match the STGNN tensors
+    all_dates = sorted(df["ds"].unique())
+    test_start_date = all_dates[-pred_len]
     
-#     # Training + Validation DataFrame (TSMixerx will split this internally using val_size=28)
-#     df_train_val = df[df["ds"] < test_start_date].copy()
+    # Training + Validation DataFrame (TSMixerx will split this internally using val_size=28)
+    df_train_val = df[df["ds"] < test_start_date].copy()
     
-#     # Test DataFrame (Strictly held out)
-#     df_test = df[df["ds"] >= test_start_date].copy()
+    # Test DataFrame (Strictly held out)
+    df_test = df[df["ds"] >= test_start_date].copy()
     
-#     stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
-#     futr_exog = ["price", "promo_depth", "is_weekend", "month_name", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
-#     hist_exog = [col for col in df.columns if 'lag' in col or 'mean' in col or 'std' in col or 'roll_sum' in col]
+    stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
+    futr_exog = ["price", "promo_depth", "is_weekend", "month_name", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
+    hist_exog = [col for col in df.columns if 'lag' in col or 'mean' in col or 'std' in col or 'roll_sum' in col]
 
-#     model = TSMixerx(
-#         h=pred_len,                  
-#         input_size=pred_len * 2,     
-#         n_series=n_series,     
-#         stat_exog_list=stat_exog,
-#         hist_exog_list=hist_exog,
-#         futr_exog_list=futr_exog,
-#         scaler_type='standard',
-#         max_steps=100,         
-#         early_stop_patience_steps=3,
-#     )
+    model = TSMixerx(
+        h=pred_len,                  
+        input_size=pred_len * 2,     
+        n_series=n_series,     
+        stat_exog_list=stat_exog,
+        hist_exog_list=hist_exog,
+        futr_exog_list=futr_exog,
+        scaler_type='standard',
+        max_steps=100,         
+        early_stop_patience_steps=3,
+    )
     
-#     nf = NeuralForecast(models=[model], freq='D')
-#     static_df = df_train_val[["unique_id"] + stat_exog].drop_duplicates()
+    nf = NeuralForecast(models=[model], freq='D')
+    static_df = df_train_val[["unique_id"] + stat_exog].drop_duplicates()
     
-#     print(f"Igniting TSMixerx baseline...")
-#     # Train only on the pre-test data
-#     nf.fit(df=df_train_val, static_df=static_df, val_size=pred_len)
+    print(f"Igniting TSMixerx baseline...")
+    # Train only on the pre-test data
+    nf.fit(df=df_train_val, static_df=static_df, val_size=pred_len)
     
-#     print("\n" + "="*50)
-#     print("🚀 RUNNING BASELINE BENCHMARK ON UNSEEN TEST SET 🚀")
-#     print("="*50)
+    print("\n" + "="*50)
+    print("🚀 RUNNING BASELINE BENCHMARK ON UNSEEN TEST SET 🚀")
+    print("="*50)
     
-#     # Provide the future exogenous covariates so it can forecast the test period
-#     futr_df = df_test[['unique_id', 'ds'] + futr_exog]
-#     predictions = nf.predict(df=df_train_val, static_df=static_df, futr_df=futr_df)
+    # Provide the future exogenous covariates so it can forecast the test period
+    futr_df = df_test[['unique_id', 'ds'] + futr_exog]
+    predictions = nf.predict(df=df_train_val, static_df=static_df, futr_df=futr_df)
     
-#     # Merge and calculate actual MAE
-#     results = predictions.merge(df_test[['unique_id', 'ds', 'y']], on=['unique_id', 'ds'], how='left')
-#     mae = (results['TSMixerx'] - results['y']).abs().mean()
-#     print(f"TSMixerx Test MAE: {mae:.4f}")
-#     print("="*50 + "\n")
+    # Merge and calculate actual MAE
+    results = predictions.merge(df_test[['unique_id', 'ds', 'y']], on=['unique_id', 'ds'], how='left')
+    mae = (results['TSMixerx'] - results['y']).abs().mean()
+    print(f"TSMixerx Test MAE: {mae:.4f}")
+    print("="*50 + "\n")
     
-#     model_dir = os.path.join(os.getcwd(), "data", "models", "tsmixerx")
-#     os.makedirs(model_dir, exist_ok=True)
-#     nf.save(path=model_dir, model_index=None, overwrite=True, save_dataset=False)
+    model_dir = os.path.join(os.getcwd(), "data", "models", "tsmixerx")
+    os.makedirs(model_dir, exist_ok=True)
+    nf.save(path=model_dir, model_index=None, overwrite=True, save_dataset=False)
 
 
 @asset(deps=["train_hybrid_stgnn"])

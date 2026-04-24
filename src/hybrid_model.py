@@ -281,17 +281,28 @@ class LitSTGNNMixer(pl.LightningModule):
     def training_step(self, batch, _batch_idx):
         x, y_hist, x_future, y = batch
         
-        # 1. Calculate RevIN statistics from the HISTORY
         mean = y_hist.mean(dim=-1, keepdim=True)
         std = y_hist.std(dim=-1, keepdim=True) + 1e-5
         
-        # 2. Normalize the Target
         y_norm = (y - mean) / std
-        
-        # 3. Predict the normalized future
         y_hat_norm = self(x, x_future)
         
-        loss = F.huber_loss(y_hat_norm, y_norm)
+        # --- SAFE ASYMMETRIC HUBER LOSS ---
+        error = y_hat_norm - y_norm
+        
+        # 1. Calculate standard Huber loss (immune to exploding gradients)
+        abs_error = torch.abs(error)
+        is_small_error = abs_error < 1.0
+        
+        squared_loss = 0.5 * (error ** 2)
+        linear_loss = abs_error - 0.5
+        
+        base_huber = torch.where(is_small_error, squared_loss, linear_loss)
+        
+        # 2. Apply a gentle asymmetry (1.2x instead of 2.5x)
+        # If error < 0 (under-forecast), multiply the safe Huber loss by 1.2
+        loss = torch.where(error < 0, base_huber * 1.2, base_huber).mean()
+        
         self.log('train_loss', loss, prog_bar=True)
         return loss
 

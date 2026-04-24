@@ -64,7 +64,16 @@ def load_sales_data(download_m5_data: str, config: SalesDataConfig) -> tuple:
 
     if config.downsample_dataset:
         # reduce to only Foods and TX of first 100 per dept, per store
-        sales_train_df = sales_train_df.query("cat_id == 'FOODS'  & dept_id == 'FOODS_1' & state_id == 'TX'")
+        # Gives exactly 1,437 nodes. Fits perfectly in 10GB VRAM.
+        # Cross-Departmental
+        sales_train_df = sales_train_df.query("store_id == 'TX_1' & cat_id == 'FOODS'")
+
+        # Gives exactly 1,695 nodes. (565 Hobbies items x 3 Texas Stores)
+        # Geographical Supply
+        # sales_train_df = sales_train_df.query("cat_id == 'HOBBIES' & state_id == 'TX'")
+
+        # Gives exactly 3,049 nodes. (rtx4090)
+        # sales_train_df = sales_train_df.query("store_id == 'TX_1'")
 
         print("Number of selected items in evaluation set:", len(sales_train_df))
 
@@ -146,32 +155,35 @@ def feature_engineering() -> pd.DataFrame:
     raw_feature_sales = raw_feature_sales.sort_values(by=["id", "item_id", "store_id", "timestamp"])
 
     #----------------------------------
-    # Lag feature for sales
+    # 1. Base Lags
     #----------------------------------
-    for lag_horizon in [28, 35, 42, 49, 56]:
+    # Create Lag 1 through 14 for the Deep Learning models
+    for lag_horizon in [1, 2, 3, 7, 14]:
+        feature_name = f"sales_lag_{lag_horizon}"
+        raw_feature_sales[feature_name] = raw_feature_sales.groupby(["id", "item_id", "store_id"])["sales"].shift(lag_horizon)
+        feature_list.append(feature_name)
+        
+    # Create Safe Lags for LightGBM
+    for lag_horizon in [28, 35, 42, 56]: 
         feature_name = f"sales_lag_{lag_horizon}"
         raw_feature_sales[feature_name] = raw_feature_sales.groupby(["id", "item_id", "store_id"])["sales"].shift(lag_horizon)
         feature_list.append(feature_name)
 
     #----------------------------------
-    # Rolling window features
+    # 2. Rolling Windows
     #----------------------------------
-    for win_day in [7, 14, 28, 84]:
-        # Create the grouped rolling object ONCE per window size and avoid data leakage
-        rolling_obj = raw_feature_sales.groupby(["id", "item_id", "store_id"])["sales_lag_28"].rolling(window=win_day)
+    for win_day in [7, 14, 28]:
+        # Track A: Deep Learning Rolling Stats (Base = Lag 1)
+        dl_rolling = raw_feature_sales.groupby(["id", "item_id", "store_id"])["sales_lag_1"].rolling(window=win_day)
+        raw_feature_sales[f"dl_sales_mean_{win_day}"] = dl_rolling.mean().reset_index(level=[0, 1, 2], drop=True)
+        raw_feature_sales[f"dl_sales_std_{win_day}"] = dl_rolling.std().reset_index(level=[0, 1, 2], drop=True)
+        feature_list.extend([f"dl_sales_mean_{win_day}", f"dl_sales_std_{win_day}"])
 
-        # Calculate the native C-optimized metrics. 
-        # groupby.rolling() creates a MultiIndex, so we drop the grouping levels to map it cleanly back to the original rows.
-        raw_feature_sales[f"sales_mean_{win_day}"] = rolling_obj.mean().reset_index(level=[0, 1, 2], drop=True)
-        raw_feature_sales[f"sales_std_{win_day}"] = rolling_obj.std().reset_index(level=[0, 1, 2], drop=True)
-        raw_feature_sales[f"sales_roll_sum_{win_day}"] = rolling_obj.sum().reset_index(level=[0, 1, 2], drop=True)
-
-        # Add to your tracking list
-        feature_list.extend([
-            f"sales_mean_{win_day}", 
-            f"sales_std_{win_day}", 
-            f"sales_roll_sum_{win_day}"
-        ])
+        # Track B: LightGBM Rolling Stats (Base = Lag 28)
+        lgb_rolling = raw_feature_sales.groupby(["id", "item_id", "store_id"])["sales_lag_28"].rolling(window=win_day)
+        raw_feature_sales[f"lgb_sales_mean_{win_day}"] = lgb_rolling.mean().reset_index(level=[0, 1, 2], drop=True)
+        raw_feature_sales[f"lgb_sales_std_{win_day}"] = lgb_rolling.std().reset_index(level=[0, 1, 2], drop=True)
+        feature_list.extend([f"lgb_sales_mean_{win_day}", f"lgb_sales_std_{win_day}"])
 
     #----------------------------------
     # Encode calendar events as features
@@ -300,12 +312,15 @@ def prepare_ml_data() -> None:
     # 2. Categorical Label Encoding
     #----------------------------------
     # Deep learning models cannot process strings. We convert them to integer IDs.
-    categorical_cols = static_metadata + ["month_name", "weekday"]
+    categorical_cols = static_metadata
     le = LabelEncoder()
     for col in categorical_cols:
         # Fill NaN categories before encoding
         df[col] = df[col].astype(object).fillna("unknown").astype(str)
         df[col] = le.fit_transform(df[col])
+
+    # One-Hot Encode the temporal categories so the math stays linear
+    df = pd.get_dummies(df, columns=["month_name", "weekday"], drop_first=True, dtype=int) 
 
     #----------------------------------
     # 3. Feature Scaling
@@ -323,10 +338,10 @@ def prepare_ml_data() -> None:
     # Find the cutoff date so we don't leak test data stats into the scaler
     pred_len = 28
     all_dates = sorted(df["ds"].unique())
-    test_start_date = all_dates[-pred_len]
+    val_start_date = all_dates[-(pred_len * 2)]
     
     # Create a mask for the training data
-    train_mask = df["ds"] < test_start_date
+    train_mask = df["ds"] < val_start_date
 
     scaler = StandardScaler()
     
@@ -365,6 +380,10 @@ def prepare_stgnn_tensors() -> None:
     n_timesteps = df["ds"].nunique()
     
     df_numeric = df.select_dtypes(include=[np.number])
+    
+    # Drop the LightGBM specific features so they don't enter the graph
+    lgb_cols = [col for col in df_numeric.columns if col.startswith("lgb_") or col in ["sales_lag_28", "sales_lag_35", "sales_lag_42", "sales_lag_56"]]
+    df_numeric = df_numeric.drop(columns=lgb_cols)
     
     ignore_cols = ["unique_id", "ds", "y"] + stat_exog
     temporal_features = [col for col in df_numeric.columns if col not in ignore_cols]
@@ -429,6 +448,9 @@ def train_lightgbm_baseline() -> None:
     all_dates = sorted(df["ds"].unique())
     test_start_date = all_dates[-pred_len]
     
+    # Drop the Deep Learning specific recent lags to prevent leakage
+    dl_cols = [col for col in df.columns if col.startswith("dl_") or col in ["sales_lag_1", "sales_lag_2", "sales_lag_3", "sales_lag_7", "sales_lag_14"]]
+    df = df.drop(columns=dl_cols)
     # Separate features from targets and identifiers
     drop_cols = ['unique_id', 'ds', 'y']
     features = [col for col in df.columns if col not in drop_cols]
@@ -597,7 +619,8 @@ def train_vanilla_stgnn() -> None:
         n_nodes=n_nodes,
         in_features=n_features,  
         hidden_features=hidden_features,
-        n_blocks=3               
+        n_blocks=3,
+        n_futr_features=len(futr_indices)               
     )
 
     # Wrap it in PyTorch Lightning
@@ -776,8 +799,15 @@ def train_deep_baselines() -> None:
     df_test = df[df["ds"] >= test_start_date].copy()
     
     stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
-    futr_exog = ["price", "promo_depth", "is_weekend", "month_name", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
-    hist_exog = [col for col in df.columns if 'lag' in col or 'mean' in col or 'std' in col or 'roll_sum' in col]
+    futr_exog = ["price", "promo_depth", "is_weekend", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
+    futr_exog = futr_exog + [col for col in df.columns if col.startswith("month_name_") or col.startswith("weekday_")]
+
+    # Drop the Deep Learning specific recent lags to prevent leakage
+    df_numeric = df.select_dtypes(include=[np.number])
+    lgb_cols = [col for col in df_numeric.columns if col.startswith("lgb_") or col in ["sales_lag_28", "sales_lag_35", "sales_lag_42", "sales_lag_56"]]
+    df_numeric = df_numeric.drop(columns=lgb_cols)
+
+    hist_exog = [col for col in df_numeric.columns if 'lag' in col or 'mean' in col or 'std' in col or 'roll_sum' in col]
 
     # Initialize all models (keeping max_steps low for quick execution on your local rig)
     models = [
@@ -918,7 +948,8 @@ def evaluate_benchmark() -> None:
             n_nodes=n_nodes, 
             in_features=n_features, 
             hidden_features=128,  # Same as we trained it with
-            n_blocks=3
+            n_blocks=3,
+            n_futr_features=len(futr_indices)
         )
         
         # Wrap it in Lightning and load the weights

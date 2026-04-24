@@ -28,7 +28,6 @@ class GraphMixerBlock(nn.Module):
         self.layer_norm = nn.LayerNorm(n_features)
 
     def forward(self, x, adj):
-        # x shape: [B, N, S, Feat]
         B, N, S, Feat = x.shape
         
         # --- Temporal Mixing ---
@@ -37,23 +36,18 @@ class GraphMixerBlock(nn.Module):
         x_temp = x_temp.permute(0, 1, 3, 2)
         x = x + x_temp
         
-        # --- Spatial Mixing (The VRAM Saver) ---
-        # 1. Apply the linear projection directly to x
-        x_proj = self.spatial_gcn.lin(x) # -> [B, N, S, Feat]
+        # --- Spatial Mixing (THE TRUE GCN FIX) ---
+        # 1. Fold Time into the Batch dimension: [B, N, S, Feat] -> [B * S, N, Feat]
+        x_folded = x.permute(0, 2, 1, 3).reshape(B * S, N, Feat)
         
-        # 2. Smash Time and Features together
-        # Shape goes from [B, N, S, Feat] -> [B, N, S * Feat]
-        x_proj_flat = x_proj.flatten(start_dim=2)
+        # 2. Duplicate the adjacency matrix for every time step
+        adj_folded = adj.repeat_interleave(S, dim=0) # -> [B * S, N, N]
         
-        # 3. Batch Matrix Multiply! (No broadcasting required)
-        x_spatial_flat = torch.bmm(adj, x_proj_flat)
+        # 3. Pass through the true PyTorch Geometric GCN layer!
+        x_spatial_folded = self.spatial_gcn(x_folded, adj_folded)
         
-        # 4. Un-smash back to normal dimensions
-        x_spatial = x_spatial_flat.view(B, N, S, Feat)
-        
-        # 5. Add the bias (if it exists)
-        if getattr(self.spatial_gcn, 'bias', None) is not None:
-            x_spatial = x_spatial + self.spatial_gcn.bias
+        # 4. Unfold back to the original shape
+        x_spatial = x_spatial_folded.view(B, S, N, Feat).permute(0, 2, 1, 3)
             
         # Add residual and normalize
         x = self.layer_norm(x + x_spatial)
@@ -87,6 +81,8 @@ class STGNNMixer(nn.Module):
         self.instance_norm = nn.InstanceNorm1d(in_features, affine=True)
         
         self.feature_projection = nn.Linear(in_features, hidden_features)
+        # A learned pool to compress the 56 days without losing order
+        self.context_pool = nn.Linear(seq_len, 1)
         
         # Instead of static node_emb, we will generate the graph dynamically
         self.query_proj = nn.Linear(hidden_features, hidden_features)
@@ -94,6 +90,9 @@ class STGNNMixer(nn.Module):
         
         # We can keep the static node embedding as a baseline "identity" for each node
         self.static_node_emb = nn.Parameter(torch.randn(n_nodes, hidden_features))
+
+        # Add a heavy dropout to penalize transductive memorization
+        self.emb_dropout = nn.Dropout(p=0.5)
         
         # We increased default blocks to 3 for deeper learning
         self.blocks = nn.ModuleList([
@@ -121,7 +120,9 @@ class STGNNMixer(nn.Module):
         
         # 2. Project features & add baseline static embeddings
         x = self.feature_projection(x) 
-        x = x + self.static_node_emb.view(1, N, 1, -1)
+        # Apply dropout to the static ID embedding before adding it
+        regularized_emb = self.emb_dropout(self.static_node_emb)
+        x = x + regularized_emb.view(1, N, 1, -1)
         
         # ---------------------------------------------------------
         # 3. THE DYNAMIC GRAPH (Context-Aware Routing)
@@ -135,7 +136,8 @@ class STGNNMixer(nn.Module):
         else: # "full" (Now completely dynamic!)
             # A. Summarize the 56-day history into a single context vector per node
             # Shape: [Batch, Nodes, Hidden]
-            x_context = x.mean(dim=2) 
+            x_pool = x.permute(0, 1, 3, 2) # -> [B, N, Hidden, S]
+            x_context = self.context_pool(x_pool).squeeze(-1) # -> [B, N, Hidden]
             
             # B. Generate Queries and Keys
             Q = self.query_proj(x_context) # [B, N, Hidden]
@@ -153,13 +155,16 @@ class STGNNMixer(nn.Module):
             topk_values, topk_indices = torch.topk(dynamic_adj, k=self.top_k, dim=2)
             mask = torch.zeros_like(dynamic_adj).scatter_(2, topk_indices, 1.0)
             
-            # THE FIX: Replace zeros with -infinity before the softmax!
+            # Replace zeros with -infinity before the softmax!
             dynamic_adj = dynamic_adj.masked_fill(mask == 0, float('-inf'))
             dynamic_adj = F.softmax(dynamic_adj, dim=2)
+
+            # Constrain alpha strictly between 0.0 and 1.0
+            alpha = torch.sigmoid(self.graph_alpha)
             
             # F. Blend with static business rules
             static_adj_batch = adj.unsqueeze(0).repeat(B, 1, 1)
-            combined_adj = (self.graph_alpha * static_adj_batch) + ((1 - self.graph_alpha) * dynamic_adj)
+            combined_adj = (alpha * static_adj_batch) + ((1 - alpha) * dynamic_adj)
             combined_adj = F.normalize(combined_adj, p=1, dim=2)
 
         # 4. Message Passing
@@ -336,48 +341,50 @@ class VanillaSTGNNBlock(nn.Module):
 
 class VanillaSTGNN(nn.Module):
     """The full model wrapper for the Vanilla baseline."""
-    def __init__(self, seq_len, pred_len, n_nodes, in_features, hidden_features, n_blocks):
+    # NEW: Added n_futr_features to the init arguments
+    def __init__(self, seq_len, pred_len, n_nodes, in_features, hidden_features, n_blocks, n_futr_features):
         super().__init__()
         
         # 1. Feature Projection
         self.input_proj = nn.Linear(in_features, hidden_features)
         
-        # 2. The Deep Layers (Using the Vanilla GRU blocks defined right above!)
+        # 2. The Deep Layers
         self.blocks = nn.ModuleList([
             VanillaSTGNNBlock(n_features=hidden_features) 
             for _ in range(n_blocks)
         ])
         
-        # 3. Output Projection to get the 28-day forecast
+        # NEW: 3. Project future features into the hidden dimension
+        self.futr_projection = nn.Linear(n_futr_features, hidden_features)
+        
+        # NEW: 4. The Output Head now accepts (GRU Final State) + (Flattened Future Info)
+        # Also added the ReLU to stop negative predictions!
         self.out_proj = nn.Sequential(
-            nn.Linear(hidden_features, pred_len),
-            nn.ReLU()
+            nn.Linear(hidden_features + (pred_len * hidden_features), pred_len),
+            nn.ReLU() 
         )
 
     def forward(self, x, x_future, adj):
-        # Extract the batch size
-        B = x.shape[0]
+        B, N, S, _ = x.shape
         
-        # Project inputs
         x = self.input_proj(x)
         
-        # ---------------------------------------------------------
-        # THE FIX: Format the Adjacency Matrix
-        # ---------------------------------------------------------
-        # 1. Normalize it so node features don't explode during Message Passing
         import torch.nn.functional as F
         adj_norm = F.normalize(adj, p=1, dim=1)
-        
-        # 2. Add the Batch dimension so it becomes [B, N, N] (e.g., [8, 1000, 1000])
         adj_batched = adj_norm.unsqueeze(0).repeat(B, 1, 1)
         
-        # Pass through the GRU/GCN blocks using the properly batched matrix
         for block in self.blocks:
             x = block(x, adj_batched)
             
-        # We take the final time step from the GRU sequence to make the prediction
+        # The GRU's summary of the 56-day history: [B, N, Hidden]
         x_final = x[:, :, -1, :] 
         
-        # Project to the 28-day forecast horizon
-        out = self.out_proj(x_final)
+        # NEW: Process Future Covariates
+        x_futr_proj = self.futr_projection(x_future)         # [B, N, Pred_Len, Hidden]
+        x_futr_flat = x_futr_proj.reshape(B, N, -1)          # [B, N, Pred_Len * Hidden]
+        
+        # NEW: Combine Historical Context with Future Knowledge
+        combined = torch.cat([x_final, x_futr_flat], dim=2)  # [B, N, Hidden + (Pred_Len * Hidden)]
+        
+        out = self.out_proj(combined)
         return out

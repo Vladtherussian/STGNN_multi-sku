@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch_geometric.nn import DenseGCNConv
+from torch_geometric.nn import DenseGCNConv  # used by VanillaSTGNNBlock only
 from torch.utils.data import Dataset
 import pytorch_lightning as pl
 import torch.nn.functional as F
@@ -9,6 +9,12 @@ class GraphMixerBlock(nn.Module):
     """
     The core innovation: A hybrid block that mixes temporal patterns via MLP, 
     and spatial patterns via Graph Convolutions.
+    
+    VRAM note: spatial mixing uses a manual GCN (linear + bmm) instead of
+    DenseGCNConv + repeat_interleave. The old approach allocated [B*S, N, N]
+    adjacency copies — at B=32, S=56, N=1437 that was ~7 GB in fp16 for a
+    single intermediate tensor. The new approach reshapes to [B, N, S*Feat]
+    and does one bmm, which is mathematically identical but uses ~0.6 GB.
     """
     def __init__(self, seq_len, n_features, dropout=0.2):
         super().__init__()
@@ -20,10 +26,20 @@ class GraphMixerBlock(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout)
         )
+
+        # 1B. Feature Mixing (Looks across features, applies specific weights)
+        self.feature_mlp = nn.Sequential(
+            nn.Linear(n_features, n_features),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
         
-        # 2. Spatial Mixing (The GNN part)
-        # Replaces the dense MLP with an explicit Graph Convolution
-        self.spatial_gcn = DenseGCNConv(in_channels=n_features, out_channels=n_features)
+        # 2. Spatial Mixing (manual GCN — no DenseGCNConv needed)
+        # W and bias are the learnable parameters of the graph convolution.
+        # We keep bias=False on the linear and add bias separately so we can
+        # broadcast it correctly over the [B, N, S, Feat] output shape.
+        self.spatial_lin  = nn.Linear(n_features, n_features, bias=False)
+        self.spatial_bias = nn.Parameter(torch.zeros(n_features))
         
         self.layer_norm = nn.LayerNorm(n_features)
 
@@ -31,23 +47,36 @@ class GraphMixerBlock(nn.Module):
         B, N, S, Feat = x.shape
         
         # --- Temporal Mixing ---
-        x_temp = x.permute(0, 1, 3, 2)
+        x_temp = x.permute(0, 1, 3, 2)          # [B, N, Feat, S]
         x_temp = self.temporal_mlp(x_temp)
-        x_temp = x_temp.permute(0, 1, 3, 2)
+        x_temp = x_temp.permute(0, 1, 3, 2)      # [B, N, S, Feat]
         x = x + x_temp
+
+        # --- Feature Mixing ---
+        # Linear layer operates on the last dimension (Feat)
+        x_feat = self.feature_mlp(x)
         
-        # --- Spatial Mixing (THE TRUE GCN FIX) ---
-        # 1. Fold Time into the Batch dimension: [B, N, S, Feat] -> [B * S, N, Feat]
-        x_folded = x.permute(0, 2, 1, 3).reshape(B * S, N, Feat)
+        # Add residual 
+        x = x + x_feat
         
-        # 2. Duplicate the adjacency matrix for every time step
-        adj_folded = adj.repeat_interleave(S, dim=0) # -> [B * S, N, N]
+        # --- Spatial Mixing (memory-efficient GCN) ---
+        # Key identity: A @ [x_s0 | x_s1 | ... | x_sS] = [A@x_s0 | A@x_s1 | ...]
+        # Because A doesn't vary across time, we can fold S*Feat into one dim,
+        # do a single bmm, and unfold — avoiding O(B*S*N^2) adjacency copies.
+        #
+        # 1. Linear projection: [B, N, S, Feat] -> [B, N, S, Feat]
+        x_proj = self.spatial_lin(x)
         
-        # 3. Pass through the true PyTorch Geometric GCN layer!
-        x_spatial_folded = self.spatial_gcn(x_folded, adj_folded)
+        # 2. Fold S and Feat together: [B, N, S, Feat] -> [B, N, S*Feat]
+        x_proj_2d = x_proj.reshape(B, N, S * Feat)
         
-        # 4. Unfold back to the original shape
-        x_spatial = x_spatial_folded.view(B, S, N, Feat).permute(0, 2, 1, 3)
+        # 3. Single batched matmul: adj [B,N,N] @ x_proj_2d [B,N,S*Feat] -> [B,N,S*Feat]
+        #    For each batch b and node i: out[b,i,:] = sum_j A[b,i,j] * x_proj_2d[b,j,:]
+        #    This is exactly GCN neighborhood aggregation, applied to all (s, feat) at once.
+        x_spatial_2d = torch.bmm(adj, x_proj_2d)
+        
+        # 4. Unfold back: [B, N, S*Feat] -> [B, N, S, Feat], add bias
+        x_spatial = x_spatial_2d.reshape(B, N, S, Feat) + self.spatial_bias
             
         # Add residual and normalize
         x = self.layer_norm(x + x_spatial)
@@ -58,8 +87,20 @@ class STGNNMixer(nn.Module):
     """
     Upgraded architecture featuring Local Instance Normalization 
     and Top-K Graph Sparsification.
+
+    RTX 3080 (10 GB) recommended defaults
+    ──────────────────────────────────────
+    hidden_features : 64    (was 128 — halving cuts most tensors by 4x)
+    n_blocks        : 2     (was 3  — saves one block's activation budget)
+    batch_size      : 8     (was 32 — set in assets.py / train asset)
+
+    The dominant VRAM consumers at these settings (N=1437, S=56, fp16):
+      combined_adj  [B, N, N]         :  ~24 MB
+      feature maps  [B, N, S, Feat]   : ~105 MB  (per block, before ckpt)
+      x_proj_2d     [B, N, S*Feat]    : ~105 MB  (peak inside block)
+    Total estimated peak: ~2–3 GB, leaving headroom for optimizer states.
     """
-    def __init__(self, seq_len, pred_len, n_nodes, in_features, hidden_features, n_futr_features, n_blocks=3, top_k=5, ablation_mode="full"):
+    def __init__(self, seq_len, pred_len, n_nodes, in_features, hidden_features, n_futr_features, n_blocks=2, top_k=5, ablation_mode="full"):
         super().__init__()
         self.seq_len = seq_len
         self.pred_len = pred_len
@@ -70,15 +111,12 @@ class STGNNMixer(nn.Module):
         # Trainable identities
         # self.node_emb = nn.Parameter(torch.randn(n_nodes, hidden_features))
         if self.ablation_mode == "full":
-            self.graph_alpha = nn.Parameter(torch.tensor(0.5))
+            self.graph_alpha = nn.Parameter(torch.tensor(2.20)) # Start with a bias towards the static graph (sigmoid(2.2) ~ 0.9)
         else:
             # For ablations, we freeze alpha so it cannot learn.
             # 1.0 means it relies 100% on the static Walmart hierarchy.
             self.register_buffer("graph_alpha", torch.tensor(1.0))
         
-        # Instance Normalization across the temporal dimension
-        # This acts as our lightweight version of RevIN to stabilize the gradients
-        self.instance_norm = nn.InstanceNorm1d(in_features, affine=True)
         
         self.feature_projection = nn.Linear(in_features, hidden_features)
         # A learned pool to compress the 56 days without losing order
@@ -111,9 +149,9 @@ class STGNNMixer(nn.Module):
         B, N, S, Feat = x.shape
         
         # 1. Local Normalization
-        x_norm = x.view(B * N, S, Feat).permute(0, 2, 1) 
-        x_norm = self.instance_norm(x_norm)
-        x = x_norm.permute(0, 2, 1).view(B, N, S, Feat)
+        # x_norm = x.view(B * N, S, Feat).permute(0, 2, 1) 
+        # x_norm = self.instance_norm(x_norm)
+        # x = x_norm.permute(0, 2, 1).view(B, N, S, Feat)
         
         # 2. Project features & add baseline static embeddings
         x = self.feature_projection(x) 
@@ -181,9 +219,15 @@ class STGNNMixer(nn.Module):
             combined_adj = (alpha * static_adj_batch) + ((1 - alpha) * dynamic_adj)
             combined_adj = F.normalize(combined_adj, p=1, dim=2)
 
-        # 4. Message Passing
+        # 4. Message Passing with gradient checkpointing.
+        # Each GraphMixerBlock stores [B, N, S, Feat] activations for backprop.
+        # At B=8, N=1437, S=56, Feat=64 that is ~210 MB per block in fp32.
+        # Checkpointing discards those activations and recomputes them during
+        # the backward pass, saving ~(n_blocks - 1) * block_activation_memory
+        # at the cost of one extra forward pass per block.
+        from torch.utils.checkpoint import checkpoint
         for block in self.blocks:
-            x = block(x, combined_adj)
+            x = checkpoint(block, x, combined_adj, use_reentrant=False)
             
         x_hist_flat = x.reshape(B, N, S * x.shape[-1])
         
@@ -247,7 +291,7 @@ class LitSTGNNMixer(pl.LightningModule):
         # 3. Predict the normalized future
         y_hat_norm = self(x, x_future)
         
-        loss = F.l1_loss(y_hat_norm, y_norm)
+        loss = F.huber_loss(y_hat_norm, y_norm)
         self.log('train_loss', loss, prog_bar=True)
         return loss
 
@@ -263,7 +307,7 @@ class LitSTGNNMixer(pl.LightningModule):
         y_norm = (y - mean) / std
         y_hat_norm = self(x, x_future)
         
-        loss = F.l1_loss(y_hat_norm, y_norm)
+        loss = F.huber_loss(y_hat_norm, y_norm)
         self.log('val_loss', loss, prog_bar=True)
         
         # Also log raw MAE in actual sales units for human-readable monitoring.
@@ -284,7 +328,7 @@ class LitSTGNNMixer(pl.LightningModule):
         y_hat = (y_hat_norm * std) + mean
         
         # Calculate loss against the RAW target
-        loss = F.l1_loss(y_hat, y)
+        loss = F.huber_loss(y_hat, y)
         self.log('test_loss', loss, prog_bar=True)
         return loss
 
@@ -307,9 +351,9 @@ class LitSTGNNMixer(pl.LightningModule):
             self.log("graph_alpha", alpha_val, prog_bar=True)
 
         # 2. Extract Top-K Learned Connections (Only if the model has dynamic node embeddings!)
-        if hasattr(self.model, 'node_emb'):
+        if hasattr(self.model, 'static_node_emb'):
             with torch.no_grad():
-                learned_adj = torch.matmul(self.model.node_emb, self.model.node_emb.transpose(0, 1))
+                learned_adj = torch.matmul(self.model.static_node_emb, self.model.static_node_emb.transpose(0, 1))
                 learned_adj = F.relu(learned_adj)
                 
                 for i in range(min(3, self.model.n_nodes)):

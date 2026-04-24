@@ -68,7 +68,7 @@ class STGNNMixer(nn.Module):
         self.ablation_mode = ablation_mode # "full", "static_graph", or "no_graph"
         
         # Trainable identities
-        self.node_emb = nn.Parameter(torch.randn(n_nodes, hidden_features))
+        # self.node_emb = nn.Parameter(torch.randn(n_nodes, hidden_features))
         if self.ablation_mode == "full":
             self.graph_alpha = nn.Parameter(torch.tensor(0.5))
         else:
@@ -104,10 +104,7 @@ class STGNNMixer(nn.Module):
         self.futr_projection = nn.Linear(n_futr_features, hidden_features)
 
         # The final head now accepts (Historical Graph Memory) + (Future Info)
-        self.head = nn.Sequential(
-            nn.Linear((seq_len * hidden_features) + (pred_len * hidden_features), pred_len),
-            nn.ReLU() # Stop negative predictions at the source!
-        )
+        self.head = nn.Sequential(nn.Linear((seq_len * hidden_features) + (pred_len * hidden_features), pred_len))
         
 
     def forward(self, x, x_future, adj):
@@ -149,15 +146,32 @@ class STGNNMixer(nn.Module):
             
             # D. Scale to prevent exploding gradients (standard attention mechanism)
             dynamic_adj = dynamic_adj / (Q.shape[-1] ** 0.5)
+            
+            # Guard 1: clamp scores before ReLU.
+            # Under fp16 mixed precision, large Q/K dot products can overflow to +inf.
+            # +inf survives ReLU and then causes softmax([+inf, -inf, ...]) = NaN.
+            # Clamping to [-10, 10] is safe — softmax is saturated well before these values.
+            dynamic_adj = dynamic_adj.clamp(min=-10.0, max=10.0)
             dynamic_adj = F.relu(dynamic_adj)
             
             # E. Top-K Sparsification (Applied per batch!)
-            topk_values, topk_indices = torch.topk(dynamic_adj, k=self.top_k, dim=2)
+            # Guard 2: top_k must not exceed N. If the downsampling config changes and
+            # produces fewer nodes than top_k, torch.topk raises a hard runtime error.
+            safe_k = min(self.top_k, N)
+            topk_values, topk_indices = torch.topk(dynamic_adj, k=safe_k, dim=2)
             mask = torch.zeros_like(dynamic_adj).scatter_(2, topk_indices, 1.0)
             
-            # Replace zeros with -infinity before the softmax!
+            # Replace non-top-K positions with -infinity before the softmax.
             dynamic_adj = dynamic_adj.masked_fill(mask == 0, float('-inf'))
             dynamic_adj = F.softmax(dynamic_adj, dim=2)
+            
+            # Guard 3: nan_to_num as a final safety net.
+            # If an entire row was zero after ReLU AND all top-K positions are zero,
+            # softmax still produces a valid uniform distribution (not NaN). But if any
+            # upstream NaN slips through (e.g. from gradient tape in rare fp16 edge cases),
+            # this replaces it with 0 so the row gets no graph signal rather than poisoning
+            # all downstream gradients with NaN.
+            dynamic_adj = torch.nan_to_num(dynamic_adj, nan=0.0)
 
             # Constrain alpha strictly between 0.0 and 1.0
             alpha = torch.sigmoid(self.graph_alpha)
@@ -243,14 +257,21 @@ class LitSTGNNMixer(pl.LightningModule):
         mean = y_hist.mean(dim=-1, keepdim=True)
         std = y_hist.std(dim=-1, keepdim=True) + 1e-5
         
+        # Normalize the target using the same RevIN statistics as training_step,
+        # so val_loss and train_loss are on the same scale.
+        # Early stopping monitors val_loss — it must be comparable to train_loss.
+        y_norm = (y - mean) / std
         y_hat_norm = self(x, x_future)
         
-        # 4. REVERSE the normalization back to real-world sales volume
-        y_hat = (y_hat_norm * std) + mean
-        
-        # Calculate loss against the RAW target to get true MAE
-        loss = F.l1_loss(y_hat, y)
+        loss = F.l1_loss(y_hat_norm, y_norm)
         self.log('val_loss', loss, prog_bar=True)
+        
+        # Also log raw MAE in actual sales units for human-readable monitoring.
+        # This is NOT used by EarlyStopping — it's for interpretability only.
+        y_hat = (y_hat_norm * std) + mean
+        val_mae_raw = F.l1_loss(y_hat, y)
+        self.log('val_mae_raw', val_mae_raw, prog_bar=False)
+        
         return loss
     
     def test_step(self, batch, _batch_idx):
@@ -273,7 +294,7 @@ class LitSTGNNMixer(pl.LightningModule):
     def on_train_epoch_end(self):
         # 1. Log Graph Alpha (Only if the core model has it!)
         if hasattr(self.model, 'graph_alpha'):
-            alpha_val = self.model.graph_alpha.item()
+            alpha_val = torch.sigmoid(self.model.graph_alpha).item()
             
             print(f"\n--- Epoch {self.current_epoch} End ---")
             print(f"Graph Alpha (Business vs. Latent): {alpha_val:.4f}")

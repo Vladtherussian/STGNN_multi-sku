@@ -73,7 +73,7 @@ def load_sales_data(download_m5_data: str, config: SalesDataConfig) -> tuple:
         # sales_train_df = sales_train_df.query("cat_id == 'HOBBIES' & state_id == 'TX'")
 
         # Gives exactly 3,049 nodes. (rtx4090)
-        # sales_train_df = sales_train_df.query("store_id == 'TX_1'")
+        # sales_train_df = sales_train_df.query("store_id in ['TX_1']")
 
         print("Number of selected items in evaluation set:", len(sales_train_df))
 
@@ -367,13 +367,49 @@ def prepare_stgnn_tensors() -> None:
     
     # Ensure perfect sorting: Nodes first, then Time. 
     df = df.sort_values(by=["unique_id", "ds"])
+
+    # --- NEW: Calculate Historical Volume ---
+    # Find the cutoff date so we only calculate volume from the training set
+    pred_len = 28
+    all_dates = sorted(df["ds"].unique())
+    val_start_date = all_dates[-(pred_len * 2)]
+    
+    # Get the mean sales per item from the training period
+    train_df = df[df["ds"] < val_start_date]
+    volumes = train_df.groupby("unique_id")["y"].mean().reset_index(name="hist_volume")
     
     # 2. Extract the Static DataFrame for the Adjacency Matrix
     stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"] 
     static_df = df[["unique_id"] + stat_exog].drop_duplicates().sort_values("unique_id")
     
-    # 3. Call your custom function to build the graph!
-    adj_tensor = build_weighted_adjacency(static_df=static_df, stat_exog_cols=stat_exog)
+    # Merge the volume data into the static_df
+    static_df = static_df.merge(volumes, on="unique_id", how="left").fillna(0)
+    
+    # 3. Call your custom function to build the volume-weighted graph!
+    # from .utils import build_weighted_adjacency
+    adj_tensor = build_weighted_adjacency(static_df=static_df, stat_exog_cols=stat_exog, volume_col="hist_volume")
+
+    # ---------------------------------------------------------
+    # NEW: Leak-Proof Department Aggregate Feature
+    # ---------------------------------------------------------
+    # 1. Calculate the raw average daily sales for each department
+    dept_daily = df.groupby(["dept_id", "ds"])["y"].mean().reset_index(name="dept_daily_mean")
+    
+    # 2. Sort perfectly by time to ensure rolling works correctly
+    dept_daily = dept_daily.sort_values(by=["dept_id", "ds"])
+    
+    # 3. Apply the rolling mean, shifting by 1 to prevent data leakage
+    dept_daily["dept_sales_mean_28"] = dept_daily.groupby("dept_id")["dept_daily_mean"].transform(
+        lambda x: x.shift(1).rolling(window=28, min_periods=1).mean()
+    )
+    
+    # 4. Fill the NaN created by the shift(1) with 0
+    dept_daily["dept_sales_mean_28"] = dept_daily["dept_sales_mean_28"].fillna(0)
+    
+    # 5. Merge this safe, shifted feature back into your main flat dataframe
+    df = df.merge(dept_daily[["dept_id", "ds", "dept_sales_mean_28"]], on=["dept_id", "ds"], how="left")
+    # ---------------------------------------------------------
+
     
     # 4. Reshape Temporal Features into 3D Tensors
     n_nodes = df["unique_id"].nunique()
@@ -412,11 +448,20 @@ def prepare_stgnn_tensors() -> None:
         raise ValueError("CRITICAL: X_tensor contains NaNs or Infs! Check your upstream scaling.")
     
     # Identify Future Covariates
-    
-    futr_exog = [
-        "price", "promo_depth", "is_weekend", "month_name",
+    base_futr_exog = [
+        "price", "promo_depth", "is_weekend", 
         "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"
     ]
+    
+    # Dynamically grab all the one-hot encoded calendar columns
+    dummy_calendar_cols = [
+        col for col in temporal_features 
+        if col.startswith("month_name_") or col.startswith("weekday_")
+    ]
+    
+    # Combine the lists
+    futr_exog = base_futr_exog + dummy_calendar_cols
+    
     # Find the exact integer indices of these features inside your temporal_features list
     futr_indices = [temporal_features.index(f) for f in futr_exog if f in temporal_features]
     
@@ -436,55 +481,92 @@ def prepare_stgnn_tensors() -> None:
 
 @asset(deps=["prepare_ml_data"])
 def train_lightgbm_baseline() -> None:
-    """Trains the Kaggle-winning LightGBM baseline."""
-    import lightgbm as lgb
+    """Trains a Recursive LightGBM using MLForecast to fix the 28-day blindspot."""
     import pandas as pd
     import os
+    import lightgbm as lgb
+    from mlforecast import MLForecast
+    from window_ops.rolling import rolling_mean, rolling_std
     
     processed_dir = os.path.join(os.getcwd(), "data", "processed")
     df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
     
     pred_len = 28
     all_dates = sorted(df["ds"].unique())
+    # NEW CORRECT WAY: LightGBM stops training 56 days before the end, exactly like the STGNN
+    val_start_date = all_dates[-(pred_len * 2)]
     test_start_date = all_dates[-pred_len]
     
-    # Drop the Deep Learning specific recent lags to prevent leakage
-    dl_cols = [col for col in df.columns if col.startswith("dl_") or col in ["sales_lag_1", "sales_lag_2", "sales_lag_3", "sales_lag_7", "sales_lag_14"]]
-    df = df.drop(columns=dl_cols)
-    # Separate features from targets and identifiers
-    drop_cols = ['unique_id', 'ds', 'y']
-    features = [col for col in df.columns if col not in drop_cols]
+    df_train = df[df["ds"] < val_start_date].copy()
+    # df_test = df[df["ds"] >= test_start_date].copy()
     
-    df_train = df[df["ds"] < test_start_date].copy()
-    df_test = df[df["ds"] >= test_start_date].copy()
+    # 1. Define Exogenous Features
+    futr_exog = ["price", "promo_depth", "is_weekend", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
+    futr_exog = futr_exog + [col for col in df.columns if col.startswith("month_name_") or col.startswith("weekday_")]
+    stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
     
-    X_train, y_train = df_train[features], df_train['y']
-    X_test = df_test[features]
+    # We ONLY keep the raw target, dates, and exogenous features. 
+    # We let MLForecast build the lags recursively so there are zero data leaks!
+    keep_cols = ['unique_id', 'ds', 'y'] + futr_exog + stat_exog
+    df_train = df_train[keep_cols].copy()
+
     
-    print("Igniting LightGBM Baseline (Global Model)...")
+    # 2. Initialize the raw LightGBM Model
     model = lgb.LGBMRegressor(
         objective='tweedie',
         tweedie_variance_power=1.5,
-        n_estimators=500,        # Number of boosting rounds
-        learning_rate=0.05,      # Step size
-        num_leaves=63,           # Allows for complex feature interactions
-        n_jobs=-1,               # Blast this across all your CPU cores!
+        n_estimators=500,
+        learning_rate=0.05,
+        num_leaves=63,
+        n_jobs=-1,
         random_state=42,
         verbose=-1
     )
     
-    # Train the model
-    model.fit(X_train, y_train)
+    # 3. Wrap it in MLForecast 
+    # This automatically recreates your feature_engineering asset, but does it dynamically during inference!
+    fcst = MLForecast(
+        models={'LightGBM': model},
+        freq='D',
+        lags=[1, 2, 3, 7, 14], # Re-adds the recent lags you had to drop previously!
+        lag_transforms={
+            1: [(rolling_mean, 7), (rolling_std, 7), 
+                (rolling_mean, 14), (rolling_std, 14),
+                (rolling_mean, 28), (rolling_std, 28)]
+        }
+    )
     
-    # Generate predictions
-    predictions = df_test[['unique_id', 'ds']].copy()
-    predictions['LightGBM'] = model.predict(X_test)
+    print("Igniting Recursive LightGBM Baseline...")
     
-    # Save for the leaderboard
+    # Fit the model. static_features tells LightGBM exactly which columns are categories!
+    fcst.fit(df_train, id_col='unique_id', time_col='ds', target_col='y', static_features=stat_exog)
+    
+    # FIX: df_train ends at val_start_date-1, so MLForecast's h=1 lands on val_start_date.
+    # We need to step through both the val window AND the test window to reach
+    # the test predictions — that's h = pred_len * 2 = 56 total steps.
+    # X_df must therefore cover all 56 future dates, not just the test 28.
+    df_future = df[df["ds"] >= val_start_date][['unique_id', 'ds'] + futr_exog].copy()
+    
+    # Sanity check: every unique_id must have exactly h rows in X_df,
+    # otherwise MLForecast raises the "missing inputs" error you saw.
+    h = pred_len * 2  # 56
+    expected_rows = df_train['unique_id'].nunique() * h
+    actual_rows   = len(df_future)
+    assert actual_rows == expected_rows, (
+        f"X_df has {actual_rows} rows but expected {expected_rows}. "
+        f"Run fcst.get_missing_future({h}, df_future) to inspect gaps."
+    )
+
+    predictions = fcst.predict(h=h, X_df=df_future)
+
+    # Keep only the test window (last pred_len dates per series)
+    # The first pred_len rows per id are the val-window predictions — discard them
+    predictions = predictions[predictions['ds'] >= test_start_date].copy()
+
     out_dir = os.path.join(os.getcwd(), "data", "predictions")
     os.makedirs(out_dir, exist_ok=True)
     predictions.to_parquet(os.path.join(out_dir, "lgb_predictions.parquet"), index=False)
-    print("LightGBM baseline predictions saved.")
+    print("Recursive LightGBM baseline predictions saved.")
 
 
 @asset(deps=["prepare_stgnn_tensors"])
@@ -507,8 +589,8 @@ def train_hybrid_stgnn() -> None:
     # 2. Hyperparameters
     seq_len = 56   # 56 days of history
     pred_len = 28  # 28 days forecast
-    hidden_features = 128
-    batch_size = 32
+    hidden_features = 64
+    batch_size = 8
 
     # 3. Temporal Train/Validation/Test Split
     test_start_idx = X.shape[1] - pred_len
@@ -553,7 +635,9 @@ def train_hybrid_stgnn() -> None:
         max_epochs=100, 
         callbacks=[early_stop_callback], 
         accelerator="auto",
-        precision="16-mixed"
+        precision="16-mixed",
+        gradient_clip_val=1.0,
+        # accumulate_grad_batches=2 # <--- Tells the optimizer to wait for 2 batches (4+4=8) before updating weights
     )
 
     print(f"Igniting Custom STGNNMixer on {n_nodes} nodes...")
@@ -572,183 +656,185 @@ def train_hybrid_stgnn() -> None:
     print(f"STGNNMixer explicitly trained and saved to {model_dir}")
 
 
-@asset(deps=["prepare_stgnn_tensors"])
-def train_vanilla_stgnn() -> None:
-    """Trains the Vanilla STGNN baseline to compare against the Mixer."""
-    import torch
-    import pytorch_lightning as pl
-    from pytorch_lightning.callbacks import EarlyStopping
-    from torch.utils.data import DataLoader
-    import os
+# @asset(deps=["prepare_stgnn_tensors"])
+# def train_vanilla_stgnn() -> None:
+#     """Trains the Vanilla STGNN baseline to compare against the Mixer."""
+#     import torch
+#     import pytorch_lightning as pl
+#     from pytorch_lightning.callbacks import EarlyStopping
+#     from torch.utils.data import DataLoader
+#     import os
     
-    # NEW: Importing the FULL model (VanillaSTGNN) and your Dataset
-    from .hybrid_model import VanillaSTGNN, LitSTGNNMixer, GraphTimeSeriesDataset
+#     # NEW: Importing the FULL model (VanillaSTGNN) and your Dataset
+#     from .hybrid_model import VanillaSTGNN, LitSTGNNMixer, GraphTimeSeriesDataset
 
-    # 1. Load the payload
-    processed_dir = os.path.join(os.getcwd(), "data", "processed")
-    payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
-    X, y, adj = payload["X"], payload["y"], payload["adj"]
-    n_nodes, n_features = payload["n_nodes"], payload["n_features"]
-    futr_indices = payload["futr_indices"]
+#     # 1. Load the payload
+#     processed_dir = os.path.join(os.getcwd(), "data", "processed")
+#     payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
+#     X, y, adj = payload["X"], payload["y"], payload["adj"]
+#     n_nodes, n_features = payload["n_nodes"], payload["n_features"]
+#     futr_indices = payload["futr_indices"]
 
-    # 2. Hyperparameters
-    seq_len = 56   
-    pred_len = 28  
-    hidden_features = 128
-    batch_size = 32
+#     # 2. Hyperparameters
+#     seq_len = 56   
+#     pred_len = 28  
+#     hidden_features = 64
+#     batch_size = 8
 
-    # 3. Temporal Train/Validation Split
-    test_start_idx = X.shape[1] - pred_len
-    val_start_idx = test_start_idx - pred_len
+#     # 3. Temporal Train/Validation Split
+#     test_start_idx = X.shape[1] - pred_len
+#     val_start_idx = test_start_idx - pred_len
     
-    X_train, y_train = X[:, :val_start_idx, :], y[:, :val_start_idx]
-    X_val = X[:, val_start_idx - seq_len : test_start_idx, :]
-    y_val = y[:, val_start_idx - seq_len : test_start_idx]
+#     X_train, y_train = X[:, :val_start_idx, :], y[:, :val_start_idx]
+#     X_val = X[:, val_start_idx - seq_len : test_start_idx, :]
+#     y_val = y[:, val_start_idx - seq_len : test_start_idx]
 
-    # 4. Initialize DataLoaders
-    train_dataset = GraphTimeSeriesDataset(X_train, y_train, seq_len, pred_len, futr_indices)
-    val_dataset = GraphTimeSeriesDataset(X_val, y_val, seq_len, pred_len, futr_indices)
+#     # 4. Initialize DataLoaders
+#     train_dataset = GraphTimeSeriesDataset(X_train, y_train, seq_len, pred_len, futr_indices)
+#     val_dataset = GraphTimeSeriesDataset(X_val, y_val, seq_len, pred_len, futr_indices)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+#     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+#     val_loader = DataLoader(val_dataset, batch_size=batch_size)
 
-    # 5. Instantiate the FULL Vanilla Model (The "House")
-    core_vanilla_model = VanillaSTGNN(
-        seq_len=seq_len,
-        pred_len=pred_len,
-        n_nodes=n_nodes,
-        in_features=n_features,  
-        hidden_features=hidden_features,
-        n_blocks=3,
-        n_futr_features=len(futr_indices)               
-    )
+#     # 5. Instantiate the FULL Vanilla Model (The "House")
+#     core_vanilla_model = VanillaSTGNN(
+#         seq_len=seq_len,
+#         pred_len=pred_len,
+#         n_nodes=n_nodes,
+#         in_features=n_features,  
+#         hidden_features=hidden_features,
+#         n_blocks=3,
+#         n_futr_features=len(futr_indices)               
+#     )
 
-    # Wrap it in PyTorch Lightning
-    vanilla_model = LitSTGNNMixer(
-        model=core_vanilla_model, 
-        adj_matrix=adj, 
-        learning_rate=1e-3
-    )
+#     # Wrap it in PyTorch Lightning
+#     vanilla_model = LitSTGNNMixer(
+#         model=core_vanilla_model, 
+#         adj_matrix=adj, 
+#         learning_rate=1e-3
+#     )
     
-    # 6. Train it
-    early_stop_callback = EarlyStopping(monitor="val_loss", patience=3, mode="min")
-    trainer = pl.Trainer(
-        max_epochs=100,
-        callbacks=[early_stop_callback],
-        accelerator="auto",
-        precision="16-mixed"
-    )
+#     # 6. Train it
+#     early_stop_callback = EarlyStopping(monitor="val_loss", patience=3, mode="min")
+#     trainer = pl.Trainer(
+#         max_epochs=100,
+#         callbacks=[early_stop_callback],
+#         accelerator="auto",
+#         precision="16-mixed",
+#         gradient_clip_val=1.0
+
+#     )
     
-    print(f"Igniting Vanilla STGNN Baseline on {n_nodes} nodes...")
-    trainer.fit(vanilla_model, train_loader, val_loader)
+#     print(f"Igniting Vanilla STGNN Baseline on {n_nodes} nodes...")
+#     trainer.fit(vanilla_model, train_loader, val_loader)
     
-    # 7. Save the weights
-    model_dir = os.path.join(os.getcwd(), "data", "models", "vanilla_stgnn")
-    os.makedirs(model_dir, exist_ok=True)
-    torch.save(vanilla_model.state_dict(), os.path.join(model_dir, "weights.pt"))
-    print(f"Vanilla STGNN explicitly trained and saved to {model_dir}")
+#     # 7. Save the weights
+#     model_dir = os.path.join(os.getcwd(), "data", "models", "vanilla_stgnn")
+#     os.makedirs(model_dir, exist_ok=True)
+#     torch.save(vanilla_model.state_dict(), os.path.join(model_dir, "weights.pt"))
+#     print(f"Vanilla STGNN explicitly trained and saved to {model_dir}")
 
 
-@asset(deps=["prepare_stgnn_tensors"])
-def train_ablation_no_graph() -> None:
-    """Ablation 1: STGNN with Spatial Routing completely disabled (Identity Matrix)."""
-    import torch
-    import pytorch_lightning as pl
-    from pytorch_lightning.callbacks import EarlyStopping
-    from torch.utils.data import DataLoader
-    import os
-    from .hybrid_model import STGNNMixer, LitSTGNNMixer, GraphTimeSeriesDataset
+# @asset(deps=["prepare_stgnn_tensors"])
+# def train_ablation_no_graph() -> None:
+#     """Ablation 1: STGNN with Spatial Routing completely disabled (Identity Matrix)."""
+#     import torch
+#     import pytorch_lightning as pl
+#     from pytorch_lightning.callbacks import EarlyStopping
+#     from torch.utils.data import DataLoader
+#     import os
+#     from .hybrid_model import STGNNMixer, LitSTGNNMixer, GraphTimeSeriesDataset
 
-    # 1. Load the payload
-    processed_dir = os.path.join(os.getcwd(), "data", "processed")
-    payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
-    X, y, adj = payload["X"], payload["y"], payload["adj"]
-    n_nodes, n_features = payload["n_nodes"], payload["n_features"]
-    futr_indices = payload["futr_indices"]
-    n_futr_features = len(futr_indices)
+#     # 1. Load the payload
+#     processed_dir = os.path.join(os.getcwd(), "data", "processed")
+#     payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
+#     X, y, adj = payload["X"], payload["y"], payload["adj"]
+#     n_nodes, n_features = payload["n_nodes"], payload["n_features"]
+#     futr_indices = payload["futr_indices"]
+#     n_futr_features = len(futr_indices)
 
-    # 2. Hyperparameters & Splits
-    seq_len = 56   
-    pred_len = 28  
-    hidden_features = 128
-    batch_size = 32
+#     # 2. Hyperparameters & Splits
+#     seq_len = 56   
+#     pred_len = 28  
+#     hidden_features = 128
+#     batch_size = 32
 
-    val_split_idx = X.shape[1] - pred_len
-    X_train, y_train = X[:, :val_split_idx, :], y[:, :val_split_idx]
-    X_val = X[:, -seq_len - pred_len:, :]
-    y_val = y[:, -seq_len - pred_len:]
+#     val_split_idx = X.shape[1] - pred_len
+#     X_train, y_train = X[:, :val_split_idx, :], y[:, :val_split_idx]
+#     X_val = X[:, -seq_len - pred_len:, :]
+#     y_val = y[:, -seq_len - pred_len:]
 
-    train_dataset = GraphTimeSeriesDataset(X_train, y_train, seq_len, pred_len, futr_indices)
-    val_dataset = GraphTimeSeriesDataset(X_val, y_val, seq_len, pred_len, futr_indices)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+#     train_dataset = GraphTimeSeriesDataset(X_train, y_train, seq_len, pred_len, futr_indices)
+#     val_dataset = GraphTimeSeriesDataset(X_val, y_val, seq_len, pred_len, futr_indices)
+#     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+#     val_loader = DataLoader(val_dataset, batch_size=batch_size)
 
-    # 3. Initialize Model with "no_graph"
-    core_model = STGNNMixer(
-        seq_len=seq_len, pred_len=pred_len, n_nodes=n_nodes, 
-        in_features=n_features, hidden_features=hidden_features, 
-        n_futr_features=n_futr_features, 
-        ablation_mode="no_graph"
-    )
+#     # 3. Initialize Model with "no_graph"
+#     core_model = STGNNMixer(
+#         seq_len=seq_len, pred_len=pred_len, n_nodes=n_nodes, 
+#         in_features=n_features, hidden_features=hidden_features, 
+#         n_futr_features=n_futr_features, 
+#         ablation_mode="no_graph"
+#     )
     
-    lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj, learning_rate=1e-3)
-    trainer = pl.Trainer(max_epochs=100, callbacks=[EarlyStopping(monitor="val_loss", patience=3, mode="min")], accelerator="auto", precision="16-mixed")
+#     lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj, learning_rate=1e-3)
+#     trainer = pl.Trainer(max_epochs=100, callbacks=[EarlyStopping(monitor="val_loss", patience=3, mode="min")], accelerator="auto", precision="16-mixed")
 
-    print(f"Igniting No-Graph Ablation on {n_nodes} nodes...")
-    trainer.fit(lit_model, train_loader, val_loader)
+#     print(f"Igniting No-Graph Ablation on {n_nodes} nodes...")
+#     trainer.fit(lit_model, train_loader, val_loader)
     
-    # 4. Save to a specific folder
-    out_dir = os.path.join(os.getcwd(), "data", "models", "ablation_no_graph")
-    os.makedirs(out_dir, exist_ok=True)
-    torch.save(lit_model.state_dict(), os.path.join(out_dir, "weights.pt"))
+#     # 4. Save to a specific folder
+#     out_dir = os.path.join(os.getcwd(), "data", "models", "ablation_no_graph")
+#     os.makedirs(out_dir, exist_ok=True)
+#     torch.save(lit_model.state_dict(), os.path.join(out_dir, "weights.pt"))
 
 
-@asset(deps=["prepare_stgnn_tensors"])
-def train_ablation_static_graph() -> None:
-    """Ablation 2: STGNN restricted to the human-engineered Walmart hierarchy."""
-    import torch
-    import pytorch_lightning as pl
-    from pytorch_lightning.callbacks import EarlyStopping
-    from torch.utils.data import DataLoader
-    import os
-    from .hybrid_model import STGNNMixer, LitSTGNNMixer, GraphTimeSeriesDataset
+# @asset(deps=["prepare_stgnn_tensors"])
+# def train_ablation_static_graph() -> None:
+#     """Ablation 2: STGNN restricted to the human-engineered Walmart hierarchy."""
+#     import torch
+#     import pytorch_lightning as pl
+#     from pytorch_lightning.callbacks import EarlyStopping
+#     from torch.utils.data import DataLoader
+#     import os
+#     from .hybrid_model import STGNNMixer, LitSTGNNMixer, GraphTimeSeriesDataset
 
-    processed_dir = os.path.join(os.getcwd(), "data", "processed")
-    payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
-    X, y, adj = payload["X"], payload["y"], payload["adj"]
-    n_nodes, n_features = payload["n_nodes"], payload["n_features"]
-    futr_indices = payload["futr_indices"]
-    n_futr_features = len(futr_indices)
+#     processed_dir = os.path.join(os.getcwd(), "data", "processed")
+#     payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
+#     X, y, adj = payload["X"], payload["y"], payload["adj"]
+#     n_nodes, n_features = payload["n_nodes"], payload["n_features"]
+#     futr_indices = payload["futr_indices"]
+#     n_futr_features = len(futr_indices)
 
-    seq_len, pred_len, hidden_features, batch_size = 56, 28, 128, 32
+#     seq_len, pred_len, hidden_features, batch_size = 56, 28, 128, 32
 
-    val_split_idx = X.shape[1] - pred_len
-    X_train, y_train = X[:, :val_split_idx, :], y[:, :val_split_idx]
-    X_val = X[:, -seq_len - pred_len:, :]
-    y_val = y[:, -seq_len - pred_len:]
+#     val_split_idx = X.shape[1] - pred_len
+#     X_train, y_train = X[:, :val_split_idx, :], y[:, :val_split_idx]
+#     X_val = X[:, -seq_len - pred_len:, :]
+#     y_val = y[:, -seq_len - pred_len:]
 
-    train_dataset = GraphTimeSeriesDataset(X_train, y_train, seq_len, pred_len, futr_indices)
-    val_dataset = GraphTimeSeriesDataset(X_val, y_val, seq_len, pred_len, futr_indices)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+#     train_dataset = GraphTimeSeriesDataset(X_train, y_train, seq_len, pred_len, futr_indices)
+#     val_dataset = GraphTimeSeriesDataset(X_val, y_val, seq_len, pred_len, futr_indices)
+#     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+#     val_loader = DataLoader(val_dataset, batch_size=batch_size)
 
-    # Initialize Model with "static_graph"
-    core_model = STGNNMixer(
-        seq_len=seq_len, pred_len=pred_len, n_nodes=n_nodes, 
-        in_features=n_features, hidden_features=hidden_features, 
-        n_futr_features=n_futr_features, 
-        ablation_mode="static_graph"
-    )
+#     # Initialize Model with "static_graph"
+#     core_model = STGNNMixer(
+#         seq_len=seq_len, pred_len=pred_len, n_nodes=n_nodes, 
+#         in_features=n_features, hidden_features=hidden_features, 
+#         n_futr_features=n_futr_features, 
+#         ablation_mode="static_graph"
+#     )
     
-    lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj, learning_rate=1e-3)
-    trainer = pl.Trainer(max_epochs=100, callbacks=[EarlyStopping(monitor="val_loss", patience=3, mode="min")], accelerator="auto", precision="16-mixed")
+#     lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj, learning_rate=1e-3)
+#     trainer = pl.Trainer(max_epochs=100, callbacks=[EarlyStopping(monitor="val_loss", patience=3, mode="min")], accelerator="auto", precision="16-mixed")
 
-    print(f"Igniting Static-Graph Ablation on {n_nodes} nodes...")
-    trainer.fit(lit_model, train_loader, val_loader)
+#     print(f"Igniting Static-Graph Ablation on {n_nodes} nodes...")
+#     trainer.fit(lit_model, train_loader, val_loader)
     
-    out_dir = os.path.join(os.getcwd(), "data", "models", "ablation_static_graph")
-    os.makedirs(out_dir, exist_ok=True)
-    torch.save(lit_model.state_dict(), os.path.join(out_dir, "weights.pt"))
+#     out_dir = os.path.join(os.getcwd(), "data", "models", "ablation_static_graph")
+#     os.makedirs(out_dir, exist_ok=True)
+#     torch.save(lit_model.state_dict(), os.path.join(out_dir, "weights.pt"))
 
 @asset(deps=["prepare_ml_data"])
 def train_statistical_baselines() -> None:
@@ -781,56 +867,56 @@ def train_statistical_baselines() -> None:
     predictions.to_parquet(os.path.join(out_dir, "stats_predictions.parquet"), index=False)
     print("Statistical baseline predictions saved.")
 
-@asset(deps=["prepare_ml_data"])
-def train_deep_baselines() -> None:
-    """Trains deep learning benchmarks (TSMixerx, TFT, NHITS) on the GPU."""
-    from neuralforecast import NeuralForecast
-    from neuralforecast.models import TSMixerx, TFT, NHITS
+# @asset(deps=["prepare_ml_data"])
+# def train_deep_baselines() -> None:
+#     """Trains deep learning benchmarks (TSMixerx, TFT, NHITS) on the GPU."""
+#     from neuralforecast import NeuralForecast
+#     from neuralforecast.models import TSMixerx, TFT, NHITS
     
-    processed_dir = os.path.join(os.getcwd(), "data", "processed")
-    df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
+#     processed_dir = os.path.join(os.getcwd(), "data", "processed")
+#     df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
     
-    n_series = df["unique_id"].nunique()
-    pred_len = 28
+#     n_series = df["unique_id"].nunique()
+#     pred_len = 28
     
-    all_dates = sorted(df["ds"].unique())
-    test_start_date = all_dates[-pred_len]
-    df_train_val = df[df["ds"] < test_start_date].copy()
-    df_test = df[df["ds"] >= test_start_date].copy()
+#     all_dates = sorted(df["ds"].unique())
+#     test_start_date = all_dates[-pred_len]
+#     df_train_val = df[df["ds"] < test_start_date].copy()
+#     df_test = df[df["ds"] >= test_start_date].copy()
     
-    stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
-    futr_exog = ["price", "promo_depth", "is_weekend", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
-    futr_exog = futr_exog + [col for col in df.columns if col.startswith("month_name_") or col.startswith("weekday_")]
+#     stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
+#     futr_exog = ["price", "promo_depth", "is_weekend", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
+#     futr_exog = futr_exog + [col for col in df.columns if col.startswith("month_name_") or col.startswith("weekday_")]
 
-    # Drop the Deep Learning specific recent lags to prevent leakage
-    df_numeric = df.select_dtypes(include=[np.number])
-    lgb_cols = [col for col in df_numeric.columns if col.startswith("lgb_") or col in ["sales_lag_28", "sales_lag_35", "sales_lag_42", "sales_lag_56"]]
-    df_numeric = df_numeric.drop(columns=lgb_cols)
+#     # Drop the Deep Learning specific recent lags to prevent leakage
+#     df_numeric = df.select_dtypes(include=[np.number])
+#     lgb_cols = [col for col in df_numeric.columns if col.startswith("lgb_") or col in ["sales_lag_28", "sales_lag_35", "sales_lag_42", "sales_lag_56"]]
+#     df_numeric = df_numeric.drop(columns=lgb_cols)
 
-    hist_exog = [col for col in df_numeric.columns if 'lag' in col or 'mean' in col or 'std' in col or 'roll_sum' in col]
+#     hist_exog = [col for col in df_numeric.columns if 'lag' in col or 'mean' in col or 'std' in col or 'roll_sum' in col]
 
-    # Initialize all models (keeping max_steps low for quick execution on your local rig)
-    models = [
-        TSMixerx(h=pred_len, input_size=pred_len*2, n_series=n_series, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100),
-        TFT(h=pred_len, input_size=pred_len*2, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100),
-        NHITS(h=pred_len, input_size=pred_len*2, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100)
-    ]
+#     # Initialize all models (keeping max_steps low for quick execution on your local rig)
+#     models = [
+#         TSMixerx(h=pred_len, input_size=pred_len*2, n_series=n_series, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100),
+#         TFT(h=pred_len, input_size=pred_len*2, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100),
+#         NHITS(h=pred_len, input_size=pred_len*2, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100)
+#     ]
     
-    nf = NeuralForecast(models=models, freq='D')
-    static_df = df_train_val[["unique_id"] + stat_exog].drop_duplicates()
+#     nf = NeuralForecast(models=models, freq='D')
+#     static_df = df_train_val[["unique_id"] + stat_exog].drop_duplicates()
     
-    print("Igniting Deep Learning Baselines (TSMixerx, TFT, NHITS)...")
-    nf.fit(df=df_train_val, static_df=static_df, val_size=pred_len)
+#     print("Igniting Deep Learning Baselines (TSMixerx, TFT, NHITS)...")
+#     nf.fit(df=df_train_val, static_df=static_df, val_size=pred_len)
     
-    # Generate test predictions
-    futr_df = df_test[['unique_id', 'ds'] + futr_exog]
-    predictions = nf.predict(df=df_train_val, static_df=static_df, futr_df=futr_df)
-    predictions = predictions.reset_index()
+#     # Generate test predictions
+#     futr_df = df_test[['unique_id', 'ds'] + futr_exog]
+#     predictions = nf.predict(df=df_train_val, static_df=static_df, futr_df=futr_df)
+#     predictions = predictions.reset_index()
     
-    out_dir = os.path.join(os.getcwd(), "data", "predictions")
-    os.makedirs(out_dir, exist_ok=True)
-    predictions.to_parquet(os.path.join(out_dir, "deep_predictions.parquet"), index=False)
-    print("Deep learning predictions saved.")
+#     out_dir = os.path.join(os.getcwd(), "data", "predictions")
+#     os.makedirs(out_dir, exist_ok=True)
+#     predictions.to_parquet(os.path.join(out_dir, "deep_predictions.parquet"), index=False)
+#     print("Deep learning predictions saved.")
 
 @asset(deps=[
     "train_statistical_baselines", 
@@ -862,12 +948,13 @@ def evaluate_benchmark() -> None:
     
     # 2. Load the Baseline Predictions
     # stats_preds = pd.read_parquet(os.path.join(pred_dir, "stats_predictions.parquet"))
-    deep_preds = pd.read_parquet(os.path.join(pred_dir, "deep_predictions.parquet"))
+    # deep_preds = pd.read_parquet(os.path.join(pred_dir, "deep_predictions.parquet"))
     lgb_preds = pd.read_parquet(os.path.join(pred_dir, "lgb_predictions.parquet"))
+    all_preds = lgb_preds
     
     # Merge them into a single dataframe
     # all_preds = stats_preds.merge(deep_preds, on=["unique_id", "ds"], how="inner")
-    all_preds = deep_preds.merge(lgb_preds, on=["unique_id", "ds"], how="inner")
+    # all_preds = deep_preds.merge(lgb_preds, on=["unique_id", "ds"], how="inner")
     
     # ---------------------------------------------------------
     # 3. Generate STGNN Predictions (Full + Ablations)
@@ -890,8 +977,8 @@ def evaluate_benchmark() -> None:
     # Loop through the three variations we trained
     stgnn_models = [
         ("STGNNMixer", "stgnnmixer", "full"),
-        ("STGNN_StaticGraph", "ablation_static_graph", "static_graph"),
-        ("STGNN_NoGraph", "ablation_no_graph", "no_graph")
+        # ("STGNN_StaticGraph", "ablation_static_graph", "static_graph"),
+        # ("STGNN_NoGraph", "ablation_no_graph", "no_graph")
     ]
 
     for model_name, folder_name, ablation_mode in stgnn_models:
@@ -903,7 +990,7 @@ def evaluate_benchmark() -> None:
             continue
             
         state_dict = torch.load(weights_path)
-        hidden_features = state_dict['model.node_emb'].shape[1]
+        hidden_features = state_dict['model.static_node_emb'].shape[1]
         
         core_model = STGNNMixer(
             seq_len=seq_len, pred_len=pred_len, n_nodes=n_nodes, 
@@ -918,9 +1005,13 @@ def evaluate_benchmark() -> None:
         
         with torch.no_grad():
             mean = y_hist.mean(dim=-1, keepdim=True)
-            std = y_hist.std(dim=-1, keepdim=True) + 1e-5
-            y_hat_norm = lit_model(x_hist, x_future)
-            y_hat = (y_hat_norm * std) + mean
+            var = y_hist.var(dim=-1, keepdim=True, unbiased=False)
+            std = torch.sqrt(var + 1e-5)
+            
+            # Unpack and apply the gate in raw space
+            y_hat_norm, zero_prob = lit_model(x_hist, x_future)
+            y_hat_raw = (y_hat_norm * std) + mean
+            y_hat = y_hat_raw * zero_prob
         
         y_hat_cpu = y_hat.squeeze(0).cpu().numpy()  # Shape: [1000, 28]
         
@@ -935,68 +1026,84 @@ def evaluate_benchmark() -> None:
     # =========================================================
     # Evaluate Vanilla STGNN Baseline
     # =========================================================
-    vanilla_weights_path = os.path.join(os.getcwd(), "data", "models", "vanilla_stgnn", "weights.pt")
+    # vanilla_weights_path = os.path.join(os.getcwd(), "data", "models", "vanilla_stgnn", "weights.pt")
     
-    if os.path.exists(vanilla_weights_path):
-        print("Evaluating Vanilla STGNN Baseline...")
-        vanilla_state_dict = torch.load(vanilla_weights_path)
+    # if os.path.exists(vanilla_weights_path):
+    #     print("Evaluating Vanilla STGNN Baseline...")
+    #     vanilla_state_dict = torch.load(vanilla_weights_path)
         
-        # Instantiate the "House"
-        core_vanilla = VanillaSTGNN(
-            seq_len=seq_len, 
-            pred_len=pred_len, 
-            n_nodes=n_nodes, 
-            in_features=n_features, 
-            hidden_features=128,  # Same as we trained it with
-            n_blocks=3,
-            n_futr_features=len(futr_indices)
-        )
+    #     # Instantiate the "House"
+    #     core_vanilla = VanillaSTGNN(
+    #         seq_len=seq_len, 
+    #         pred_len=pred_len, 
+    #         n_nodes=n_nodes, 
+    #         in_features=n_features, 
+    #         hidden_features=64,  # Same as we trained it with
+    #         n_blocks=2,
+    #         n_futr_features=len(futr_indices)
+    #     )
         
-        # Wrap it in Lightning and load the weights
-        lit_vanilla = LitSTGNNMixer(model=core_vanilla, adj_matrix=adj.to(device))
-        lit_vanilla.load_state_dict(vanilla_state_dict)
-        lit_vanilla.to(device)
-        lit_vanilla.eval()
+    #     # Wrap it in Lightning and load the weights
+    #     lit_vanilla = LitSTGNNMixer(model=core_vanilla, adj_matrix=adj.to(device))
+    #     lit_vanilla.load_state_dict(vanilla_state_dict)
+    #     lit_vanilla.to(device)
+    #     lit_vanilla.eval()
         
-        with torch.no_grad():
-            mean = y_hist.mean(dim=-1, keepdim=True)
-            std = y_hist.std(dim=-1, keepdim=True) + 1e-5
-            y_hat_norm = lit_vanilla(x_hist, x_future)
-            # Denormalize
-            y_hat = (y_hat_norm * std) + mean
+    #     with torch.no_grad():
+    #         mean = y_hist.mean(dim=-1, keepdim=True)
+    #         std = y_hist.std(dim=-1, keepdim=True) + 1e-5
+    #         y_hat_norm = lit_vanilla(x_hist, x_future)
+    #         # Denormalize
+    #         y_hat = (y_hat_norm * std) + mean
             
-        y_hat_cpu = y_hat.squeeze(0).cpu().numpy()
+    #     y_hat_cpu = y_hat.squeeze(0).cpu().numpy()
         
-        # Format the predictions into a DataFrame
-        vanilla_records = []
-        for i, uid in enumerate(ordered_unique_ids):
-            for j, date in enumerate(test_dates):
-                vanilla_records.append({"unique_id": uid, "ds": date, "VanillaSTGNN": y_hat_cpu[i, j]})
+    #     # Format the predictions into a DataFrame
+    #     vanilla_records = []
+    #     for i, uid in enumerate(ordered_unique_ids):
+    #         for j, date in enumerate(test_dates):
+    #             vanilla_records.append({"unique_id": uid, "ds": date, "VanillaSTGNN": y_hat_cpu[i, j]})
                 
-        vanilla_preds = pd.DataFrame(vanilla_records)
+    #     vanilla_preds = pd.DataFrame(vanilla_records)
         
-        # Merge it into the master predictions dataframe
-        all_preds = all_preds.merge(vanilla_preds, on=["unique_id", "ds"], how="inner")
-    else:
-        print("Skipping VanillaSTGNN because weights were not found.")
+    #     # Merge it into the master predictions dataframe
+    #     all_preds = all_preds.merge(vanilla_preds, on=["unique_id", "ds"], how="inner")
+    # else:
+    #     print("Skipping VanillaSTGNN because weights were not found.")
 
     # Force all prediction columns to be 0 or higher
     model_cols = [col for col in all_preds.columns if col not in ['unique_id', 'ds', 'y']]
     all_preds[model_cols] = all_preds[model_cols].clip(lower=0.0)
 
     # ---------------------------------------------------------
+    # 🔥 THE ENSEMBLE HYBRID 🔥
+    # ---------------------------------------------------------
+    # We take a simple 50/50 average of the two most powerful models.
+    # Because they make uncorrelated errors, the average will likely beat both of them natively.
+    if "LightGBM" in all_preds.columns and "STGNNMixer" in all_preds.columns:
+        all_preds["Hybrid_Ensemble"] = (all_preds["LightGBM"] * 0.5) + (all_preds["STGNNMixer"] * 0.5)
+        
+        
+
+    # ---------------------------------------------------------
     # 4. Calculate Final Metrics
     # ---------------------------------------------------------
+    raw_feature_sales = pd.read_parquet(os.path.join(DATA_DIR, "processed", "raw_feature_sales.parquet"))
+    # Sort by timestamp to ensure correct order for lag features
+    raw_feature_sales = raw_feature_sales.sort_values(by=["id", "item_id", "store_id", "timestamp"])
+
     print("\nCalculating rigorous M5 validation metrics...")
     
     # Update the names list to include your ablations
     model_names = ["AutoARIMA", "AutoETS", "TSMixerx", "TFT", "NHITS", "STGNNMixer", 
-                   "STGNN_StaticGraph", "STGNN_NoGraph", "VanillaSTGNN", "LightGBM"]
+                   "STGNN_StaticGraph", "STGNN_NoGraph", "VanillaSTGNN", "LightGBM", "Hybrid_Ensemble" ]
+    
+    
     
     # Filter the list down to models that actually exist in the dataframe
     model_names = [m for m in model_names if m in all_preds.columns]
     
-    results_df = calculate_m5_metrics(train_df, test_df, all_preds, model_names, pred_len)
+    results_df = calculate_m5_metrics(train_df, test_df, all_preds, model_names, raw_feature_sales, pred_len)
     
     print("\n" + "="*80)
     print("🏆 FINAL FORECASTING TOURNAMENT LEADERBOARD 🏆")
@@ -1015,69 +1122,76 @@ def evaluate_benchmark() -> None:
     all_preds.to_parquet(final_pred_path, index=False)
     print(f"Master predictions file saved for visualization: {final_pred_path}")
 
-@asset(deps=["prepare_ml_data"])
-def train_tsmixerx() -> None:
-    from neuralforecast import NeuralForecast
-    from neuralforecast.models import TSMixerx
-    import pandas as pd
-    import os
+# @asset(deps=["prepare_ml_data"])
+# def train_tsmixerx() -> None:
+#     from neuralforecast import NeuralForecast
+#     from neuralforecast.models import TSMixerx
+#     import pandas as pd
+#     import os
     
-    processed_dir = os.path.join(os.getcwd(), "data", "processed")
-    df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
+#     processed_dir = os.path.join(os.getcwd(), "data", "processed")
+#     df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
     
-    n_series = df["unique_id"].nunique()
-    pred_len = 28
+#     n_series = df["unique_id"].nunique()
+#     pred_len = 28
     
-    # NEW: Split the dataframe by Date to match the STGNN tensors
-    all_dates = sorted(df["ds"].unique())
-    test_start_date = all_dates[-pred_len]
+#     # NEW: Split the dataframe by Date to match the STGNN tensors
+#     all_dates = sorted(df["ds"].unique())
+#     test_start_date = all_dates[-pred_len]
     
-    # Training + Validation DataFrame (TSMixerx will split this internally using val_size=28)
-    df_train_val = df[df["ds"] < test_start_date].copy()
+#     # Training + Validation DataFrame (TSMixerx will split this internally using val_size=28)
+#     df_train_val = df[df["ds"] < test_start_date].copy()
     
-    # Test DataFrame (Strictly held out)
-    df_test = df[df["ds"] >= test_start_date].copy()
+#     # Test DataFrame (Strictly held out)
+#     df_test = df[df["ds"] >= test_start_date].copy()
     
-    stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
-    futr_exog = ["price", "promo_depth", "is_weekend", "month_name", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
-    hist_exog = [col for col in df.columns if 'lag' in col or 'mean' in col or 'std' in col or 'roll_sum' in col]
+#     stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
+#     futr_exog = ["price", "promo_depth", "is_weekend", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
+#     futr_exog = futr_exog + [col for col in df.columns if col.startswith("month_name_") or col.startswith("weekday_")]
+    
+#     #  Drop the Deep Learning specific recent lags to prevent leakage
+#     df_numeric = df.select_dtypes(include=[np.number])
+#     lgb_cols = [col for col in df_numeric.columns if col.startswith("lgb_") or col in ["sales_lag_28", "sales_lag_35", "sales_lag_42", "sales_lag_56"]]
+#     df_numeric = df_numeric.drop(columns=lgb_cols)
 
-    model = TSMixerx(
-        h=pred_len,                  
-        input_size=pred_len * 2,     
-        n_series=n_series,     
-        stat_exog_list=stat_exog,
-        hist_exog_list=hist_exog,
-        futr_exog_list=futr_exog,
-        scaler_type='standard',
-        max_steps=100,         
-        early_stop_patience_steps=3,
-    )
+#     hist_exog = [col for col in df_numeric.columns if 'lag' in col or 'mean' in col or 'std' in col or 'roll_sum' in col]
+
+#     model = TSMixerx(
+#         h=pred_len,                  
+#         input_size=pred_len * 2,     
+#         n_series=n_series,     
+#         stat_exog_list=stat_exog,
+#         hist_exog_list=hist_exog,
+#         futr_exog_list=futr_exog,
+#         scaler_type='standard',
+#         max_steps=100,         
+#         early_stop_patience_steps=3,
+#     )
     
-    nf = NeuralForecast(models=[model], freq='D')
-    static_df = df_train_val[["unique_id"] + stat_exog].drop_duplicates()
+#     nf = NeuralForecast(models=[model], freq='D')
+#     static_df = df_train_val[["unique_id"] + stat_exog].drop_duplicates()
     
-    print(f"Igniting TSMixerx baseline...")
-    # Train only on the pre-test data
-    nf.fit(df=df_train_val, static_df=static_df, val_size=pred_len)
+#     print(f"Igniting TSMixerx baseline...")
+#     # Train only on the pre-test data
+#     nf.fit(df=df_train_val, static_df=static_df, val_size=pred_len)
     
-    print("\n" + "="*50)
-    print("🚀 RUNNING BASELINE BENCHMARK ON UNSEEN TEST SET 🚀")
-    print("="*50)
+#     print("\n" + "="*50)
+#     print("🚀 RUNNING BASELINE BENCHMARK ON UNSEEN TEST SET 🚀")
+#     print("="*50)
     
-    # Provide the future exogenous covariates so it can forecast the test period
-    futr_df = df_test[['unique_id', 'ds'] + futr_exog]
-    predictions = nf.predict(df=df_train_val, static_df=static_df, futr_df=futr_df)
+#     # Provide the future exogenous covariates so it can forecast the test period
+#     futr_df = df_test[['unique_id', 'ds'] + futr_exog]
+#     predictions = nf.predict(df=df_train_val, static_df=static_df, futr_df=futr_df)
     
-    # Merge and calculate actual MAE
-    results = predictions.merge(df_test[['unique_id', 'ds', 'y']], on=['unique_id', 'ds'], how='left')
-    mae = (results['TSMixerx'] - results['y']).abs().mean()
-    print(f"TSMixerx Test MAE: {mae:.4f}")
-    print("="*50 + "\n")
+#     # Merge and calculate actual MAE
+#     results = predictions.merge(df_test[['unique_id', 'ds', 'y']], on=['unique_id', 'ds'], how='left')
+#     mae = (results['TSMixerx'] - results['y']).abs().mean()
+#     print(f"TSMixerx Test MAE: {mae:.4f}")
+#     print("="*50 + "\n")
     
-    model_dir = os.path.join(os.getcwd(), "data", "models", "tsmixerx")
-    os.makedirs(model_dir, exist_ok=True)
-    nf.save(path=model_dir, model_index=None, overwrite=True, save_dataset=False)
+#     model_dir = os.path.join(os.getcwd(), "data", "models", "tsmixerx")
+#     os.makedirs(model_dir, exist_ok=True)
+#     nf.save(path=model_dir, model_index=None, overwrite=True, save_dataset=False)
 
 
 @asset(deps=["train_hybrid_stgnn"])
@@ -1126,7 +1240,7 @@ def explain_forecast_captum() -> None:
     
     weights_path = os.path.join(model_dir, "weights.pt")
     state_dict = torch.load(weights_path)
-    hidden_features = state_dict['model.node_emb'].shape[1]
+    hidden_features = state_dict['model.static_node_emb'].shape[1]
 
     # 3. GPU Acceleration Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

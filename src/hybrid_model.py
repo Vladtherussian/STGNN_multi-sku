@@ -18,7 +18,9 @@ class GraphMixerBlock(nn.Module):
     """
     def __init__(self, seq_len, n_features, dropout=0.2):
         super().__init__()
-        
+        self.weekly_conv  = nn.Conv1d(1, 1, kernel_size=7, padding="same", bias=False)
+        self.monthly_conv = nn.Conv1d(1, 1, kernel_size=28, padding="same", bias=False)
+
         # 1. Temporal Mixing (The MLP part)
         # Looks across time for a single SKU to find trends and lag patterns
         self.temporal_mlp = nn.Sequential(
@@ -45,6 +47,11 @@ class GraphMixerBlock(nn.Module):
 
     def forward(self, x, adj):
         B, N, S, Feat = x.shape
+
+        x_conv = x.permute(0, 1, 3, 2).reshape(B * N * Feat, 1, S)
+        weekly_signal  = self.weekly_conv(x_conv).reshape(B, N, Feat, S).permute(0, 1, 3, 2)
+        monthly_signal = self.monthly_conv(x_conv).reshape(B, N, Feat, S).permute(0, 1, 3, 2)
+        x = x + weekly_signal + monthly_signal   # inject before the MLP
         
         # --- Temporal Mixing ---
         x_temp = x.permute(0, 1, 3, 2)          # [B, N, Feat, S]
@@ -119,8 +126,16 @@ class STGNNMixer(nn.Module):
         
         
         self.feature_projection = nn.Linear(in_features, hidden_features)
-        # A learned pool to compress the 56 days without losing order
-        self.context_pool = nn.Linear(seq_len, 1)
+        
+        # --- UPGRADE 1: Exponential Recency Weighting ---
+        # Exponentially decaying weights — more weight on recent time steps 
+        # 14.0 is the half-life: recent promotional behavior dominates the graph construction [cite: 121, 122]
+        decay = torch.exp(-torch.arange(seq_len, 0, -1).float() / 14.0)
+        self.register_buffer('recency_weights', decay / decay.sum())
+        
+        # --- UPGRADE 2: Zero-Inflation Gate ---
+        # A Bernoulli gate to predict "is this item selling at all during this horizon" [cite: 131]
+        self.zero_gate = nn.Linear((seq_len * hidden_features) + (pred_len * hidden_features), pred_len)
         
         # Instead of static node_emb, we will generate the graph dynamically
         self.query_proj = nn.Linear(hidden_features, hidden_features)
@@ -170,9 +185,9 @@ class STGNNMixer(nn.Module):
             
         else: # "full" (Now completely dynamic!)
             # A. Summarize the 56-day history into a single context vector per node
-            # Shape: [Batch, Nodes, Hidden]
-            x_pool = x.permute(0, 1, 3, 2) # -> [B, N, Hidden, S]
-            x_context = self.context_pool(x_pool).squeeze(-1) # -> [B, N, Hidden]
+            # Shape: [B, N, Hidden]
+            # We use the exponential recency weights so recent shocks drive the graph 
+            x_context = (x * self.recency_weights.view(1, 1, -1, 1)).sum(dim=2)
             
             # B. Generate Queries and Keys
             Q = self.query_proj(x_context) # [B, N, Hidden]
@@ -235,10 +250,14 @@ class STGNNMixer(nn.Module):
         x_futr_proj = self.futr_projection(x_future)
         x_futr_flat = x_futr_proj.reshape(B, N, -1)
         
-        # 6. Predict
+        # 6. Predict with Zero-Inflation Calibration
         combined = torch.cat([x_hist_flat, x_futr_flat], dim=2)
-        out = self.head(combined) 
-        return out
+        
+        sales_forecast = self.head(combined)                        # Continuous quantity [cite: 131]
+        zero_prob = torch.sigmoid(self.zero_gate(combined))         # Probability the item is selling [cite: 131]
+        
+        # Gated output drastically reduces false positives on intermittent items [cite: 131, 132]
+        return sales_forecast, zero_prob            
 
 
 class GraphTimeSeriesDataset(Dataset):
@@ -282,61 +301,80 @@ class LitSTGNNMixer(pl.LightningModule):
         x, y_hist, x_future, y = batch
         
         mean = y_hist.mean(dim=-1, keepdim=True)
-        std = y_hist.std(dim=-1, keepdim=True) + 1e-5
+        var = y_hist.var(dim=-1, keepdim=True, unbiased=False)
+        std = torch.sqrt(var + 1e-5)
         
         y_norm = (y - mean) / std
-        y_hat_norm = self(x, x_future)
         
-        # --- SAFE ASYMMETRIC HUBER LOSS ---
-        error = y_hat_norm - y_norm
+        # 1. Unpack the tuple
+        y_hat_norm, zero_prob = self(x, x_future)
         
-        # 1. Calculate standard Huber loss (immune to exploding gradients)
-        abs_error = torch.abs(error)
-        is_small_error = abs_error < 1.0
+        # 2. Denormalize FIRST, then apply the zero-gate in raw space
+        y_hat_raw = (y_hat_norm * std) + mean
+        y_hat = y_hat_raw * zero_prob
         
-        squared_loss = 0.5 * (error ** 2)
-        linear_loss = abs_error - 0.5
+        y_clamp = y.clamp(min=0.0)
+        y_hat_clamp = y_hat.clamp(min=1e-3)
+
+        primary_loss = F.mse_loss(torch.log1p(y_hat_clamp), torch.log1p(y_clamp))
         
-        base_huber = torch.where(is_small_error, squared_loss, linear_loss)
+        # Graph consistency loss uses the normalized latent trajectory
+        residuals = (y_norm - y_hat_norm)          
+        res_mean = residuals.mean(dim=-1)          
         
-        # 2. Apply a gentle asymmetry (1.2x instead of 2.5x)
-        # If error < 0 (under-forecast), multiply the safe Huber loss by 1.2
-        loss = torch.where(error < 0, base_huber * 1.2, base_huber).mean()
+        neighbor_res = torch.bmm(
+            self.adj_matrix.unsqueeze(0).expand(residuals.shape[0], -1, -1),
+            res_mean.unsqueeze(-1)
+        ).squeeze(-1)
+        
+        graph_loss = F.mse_loss(res_mean, neighbor_res.detach())
+        loss = primary_loss + 0.1 * graph_loss
         
         self.log('train_loss', loss, prog_bar=True)
         return loss
+        
 
     def validation_step(self, batch, _batch_idx):
         x, y_hist, x_future, y = batch
         
         mean = y_hist.mean(dim=-1, keepdim=True)
-        std = y_hist.std(dim=-1, keepdim=True) + 1e-5
+        # Robust fp16 standard deviation to prevent NaNs
+        var = y_hist.var(dim=-1, keepdim=True, unbiased=False)
+        std = torch.sqrt(var + 1e-5)
         
-        # Normalize the target using the same RevIN statistics as training_step,
-        # so val_loss and train_loss are on the same scale.
-        # Early stopping monitors val_loss — it must be comparable to train_loss.
-        y_norm = (y - mean) / std
-        y_hat_norm = self(x, x_future)
+        # 1. Unpack the tuple
+        y_hat_norm, zero_prob = self(x, x_future)
         
-        loss = F.huber_loss(y_hat_norm, y_norm)
+        # 2. Denormalize FIRST, then apply the zero-gate in raw space
+        y_hat_raw = (y_hat_norm * std) + mean
+        y_hat = y_hat_raw * zero_prob
+        
+        # Same MSLE as training_step
+        y_clamp = y.clamp(min=0.0)
+        y_hat_clamp = y_hat.clamp(min=1e-3)
+        loss = F.mse_loss(torch.log1p(y_hat_clamp), torch.log1p(y_clamp))
+        
         self.log('val_loss', loss, prog_bar=True)
         
-        # Also log raw MAE in actual sales units for human-readable monitoring.
-        # This is NOT used by EarlyStopping — it's for interpretability only.
-        y_hat = (y_hat_norm * std) + mean
+        # Keep raw MAE for human-readable monitoring only
         val_mae_raw = F.l1_loss(y_hat, y)
         self.log('val_mae_raw', val_mae_raw, prog_bar=False)
-        
         return loss
     
     def test_step(self, batch, _batch_idx):
         x, y_hist, x_future, y = batch
         
         mean = y_hist.mean(dim=-1, keepdim=True)
-        std = y_hist.std(dim=-1, keepdim=True) + 1e-5
+        # Robust fp16 standard deviation to prevent NaNs
+        var = y_hist.var(dim=-1, keepdim=True, unbiased=False)
+        std = torch.sqrt(var + 1e-5)
         
-        y_hat_norm = self(x, x_future)
-        y_hat = (y_hat_norm * std) + mean
+        # 1. Unpack the tuple
+        y_hat_norm, zero_prob = self(x, x_future)
+        
+        # 2. Denormalize FIRST, then apply the zero-gate in raw space
+        y_hat_raw = (y_hat_norm * std) + mean
+        y_hat = y_hat_raw * zero_prob
         
         # Calculate loss against the RAW target
         loss = F.huber_loss(y_hat, y)

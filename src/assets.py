@@ -933,6 +933,7 @@ def evaluate_benchmark() -> None:
     import os
     from .utils import calculate_m5_metrics
     from .hybrid_model import STGNNMixer, LitSTGNNMixer
+    import torch.nn.functional as F
     
     processed_dir = os.path.join(os.getcwd(), "data", "processed")
     pred_dir = os.path.join(os.getcwd(), "data", "predictions")
@@ -1004,14 +1005,18 @@ def evaluate_benchmark() -> None:
         lit_model.eval()
         
         with torch.no_grad():
-            mean = y_hist.mean(dim=-1, keepdim=True)
-            var = y_hist.var(dim=-1, keepdim=True, unbiased=False)
+            # FP32 Armor for Evaluation
+            y_hist_fp32 = y_hist.float()
+            mean = y_hist_fp32.mean(dim=-1, keepdim=True)
+            var = y_hist_fp32.var(dim=-1, keepdim=True, unbiased=False)
             std = torch.sqrt(var + 1e-5)
             
-            # Unpack and apply the gate in raw space
-            y_hat_norm, zero_prob = lit_model(x_hist, x_future)
-            y_hat_raw = (y_hat_norm * std) + mean
-            y_hat = y_hat_raw * zero_prob
+            # Unpack the Tuple
+            y_hat_norm = lit_model(x_hist, x_future)
+            
+            # Upcast and denormalize
+            y_hat_raw = (y_hat_norm.float() * std) + mean
+            y_hat = F.softplus(y_hat_raw)
         
         y_hat_cpu = y_hat.squeeze(0).cpu().numpy()  # Shape: [1000, 28]
         

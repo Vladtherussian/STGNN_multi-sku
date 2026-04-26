@@ -7,86 +7,66 @@ import torch.nn.functional as F
 
 class GraphMixerBlock(nn.Module):
     """
-    The core innovation: A hybrid block that mixes temporal patterns via MLP, 
-    and spatial patterns via Graph Convolutions.
-    
-    VRAM note: spatial mixing uses a manual GCN (linear + bmm) instead of
-    DenseGCNConv + repeat_interleave. The old approach allocated [B*S, N, N]
-    adjacency copies — at B=32, S=56, N=1437 that was ~7 GB in fp16 for a
-    single intermediate tensor. The new approach reshapes to [B, N, S*Feat]
-    and does one bmm, which is mathematically identical but uses ~0.6 GB.
+    Upgraded to Pre-Norm Architecture for FP16 stability.
+    Applies LayerNorm before every sub-block to prevent activation overflow.
     """
     def __init__(self, seq_len, n_features, dropout=0.2):
         super().__init__()
         self.weekly_conv  = nn.Conv1d(1, 1, kernel_size=7, padding="same", bias=False)
         self.monthly_conv = nn.Conv1d(1, 1, kernel_size=28, padding="same", bias=False)
 
-        # 1. Temporal Mixing (The MLP part)
-        # Looks across time for a single SKU to find trends and lag patterns
+        # Pre-Norm layers for every residual pathway
+        self.norm_conv = nn.LayerNorm(n_features)
+        self.norm_temp = nn.LayerNorm(n_features)
+        self.norm_feat = nn.LayerNorm(n_features)
+        self.norm_spat = nn.LayerNorm(n_features)
+
         self.temporal_mlp = nn.Sequential(
             nn.Linear(seq_len, seq_len),
             nn.GELU(),
             nn.Dropout(dropout)
         )
 
-        # 1B. Feature Mixing (Looks across features, applies specific weights)
         self.feature_mlp = nn.Sequential(
             nn.Linear(n_features, n_features),
             nn.GELU(),
             nn.Dropout(dropout)
         )
         
-        # 2. Spatial Mixing (manual GCN — no DenseGCNConv needed)
-        # W and bias are the learnable parameters of the graph convolution.
-        # We keep bias=False on the linear and add bias separately so we can
-        # broadcast it correctly over the [B, N, S, Feat] output shape.
         self.spatial_lin  = nn.Linear(n_features, n_features, bias=False)
         self.spatial_bias = nn.Parameter(torch.zeros(n_features))
-        
-        self.layer_norm = nn.LayerNorm(n_features)
 
     def forward(self, x, adj):
         B, N, S, Feat = x.shape
 
-        x_conv = x.permute(0, 1, 3, 2).reshape(B * N * Feat, 1, S)
+        # 1. Convolution Mixing (Pre-Norm)
+        x_norm = self.norm_conv(x)
+        x_conv = x_norm.permute(0, 1, 3, 2).reshape(B * N * Feat, 1, S)
         weekly_signal  = self.weekly_conv(x_conv).reshape(B, N, Feat, S).permute(0, 1, 3, 2)
         monthly_signal = self.monthly_conv(x_conv).reshape(B, N, Feat, S).permute(0, 1, 3, 2)
-        x = x + weekly_signal + monthly_signal   # inject before the MLP
+        x = x + weekly_signal + monthly_signal   
         
-        # --- Temporal Mixing ---
-        x_temp = x.permute(0, 1, 3, 2)          # [B, N, Feat, S]
+        # 2. Temporal Mixing (Pre-Norm)
+        x_norm = self.norm_temp(x)
+        x_temp = x_norm.permute(0, 1, 3, 2)          
         x_temp = self.temporal_mlp(x_temp)
-        x_temp = x_temp.permute(0, 1, 3, 2)      # [B, N, S, Feat]
+        x_temp = x_temp.permute(0, 1, 3, 2)      
         x = x + x_temp
 
-        # --- Feature Mixing ---
-        # Linear layer operates on the last dimension (Feat)
-        x_feat = self.feature_mlp(x)
-        
-        # Add residual 
+        # 3. Feature Mixing (Pre-Norm)
+        x_norm = self.norm_feat(x)
+        x_feat = self.feature_mlp(x_norm)
         x = x + x_feat
         
-        # --- Spatial Mixing (memory-efficient GCN) ---
-        # Key identity: A @ [x_s0 | x_s1 | ... | x_sS] = [A@x_s0 | A@x_s1 | ...]
-        # Because A doesn't vary across time, we can fold S*Feat into one dim,
-        # do a single bmm, and unfold — avoiding O(B*S*N^2) adjacency copies.
-        #
-        # 1. Linear projection: [B, N, S, Feat] -> [B, N, S, Feat]
-        x_proj = self.spatial_lin(x)
+        # 4. Spatial Mixing (Pre-Norm)
+        x_norm = self.norm_spat(x)
+        x_proj = self.spatial_lin(x_norm)
         
-        # 2. Fold S and Feat together: [B, N, S, Feat] -> [B, N, S*Feat]
         x_proj_2d = x_proj.reshape(B, N, S * Feat)
-        
-        # 3. Single batched matmul: adj [B,N,N] @ x_proj_2d [B,N,S*Feat] -> [B,N,S*Feat]
-        #    For each batch b and node i: out[b,i,:] = sum_j A[b,i,j] * x_proj_2d[b,j,:]
-        #    This is exactly GCN neighborhood aggregation, applied to all (s, feat) at once.
         x_spatial_2d = torch.bmm(adj, x_proj_2d)
-        
-        # 4. Unfold back: [B, N, S*Feat] -> [B, N, S, Feat], add bias
         x_spatial = x_spatial_2d.reshape(B, N, S, Feat) + self.spatial_bias
             
-        # Add residual and normalize
-        x = self.layer_norm(x + x_spatial)
+        x = x + x_spatial
         
         return x
 
@@ -126,6 +106,7 @@ class STGNNMixer(nn.Module):
         
         
         self.feature_projection = nn.Linear(in_features, hidden_features)
+        self.input_norm = nn.LayerNorm(hidden_features)
         
         # --- UPGRADE 1: Exponential Recency Weighting ---
         # Exponentially decaying weights — more weight on recent time steps 
@@ -135,14 +116,14 @@ class STGNNMixer(nn.Module):
         
         # --- UPGRADE 2: Zero-Inflation Gate ---
         # A Bernoulli gate to predict "is this item selling at all during this horizon" [cite: 131]
-        self.zero_gate = nn.Linear((seq_len * hidden_features) + (pred_len * hidden_features), pred_len)
+        # self.zero_gate = nn.Linear((seq_len * hidden_features) + (pred_len * hidden_features), pred_len)
         
         # Instead of static node_emb, we will generate the graph dynamically
         self.query_proj = nn.Linear(hidden_features, hidden_features)
         self.key_proj = nn.Linear(hidden_features, hidden_features)
         
         # We can keep the static node embedding as a baseline "identity" for each node
-        self.static_node_emb = nn.Parameter(torch.randn(n_nodes, hidden_features))
+        self.static_node_emb = nn.Parameter(torch.randn(n_nodes, hidden_features) * 0.02) # Small init to prevent early training instability
 
         # Add a heavy dropout to penalize transductive memorization
         self.emb_dropout = nn.Dropout(p=0.5)
@@ -170,8 +151,10 @@ class STGNNMixer(nn.Module):
         
         # 2. Project features & add baseline static embeddings
         x = self.feature_projection(x) 
+        x = self.input_norm(x)
         # Apply dropout to the static ID embedding before adding it
         regularized_emb = self.emb_dropout(self.static_node_emb)
+        regularized_emb = F.normalize(regularized_emb, p=2, dim=-1)  # unit norm
         x = x + regularized_emb.view(1, N, 1, -1)
         
         # ---------------------------------------------------------
@@ -250,14 +233,11 @@ class STGNNMixer(nn.Module):
         x_futr_proj = self.futr_projection(x_future)
         x_futr_flat = x_futr_proj.reshape(B, N, -1)
         
-        # 6. Predict with Zero-Inflation Calibration
+        # 6. Predict (No Gate!)
         combined = torch.cat([x_hist_flat, x_futr_flat], dim=2)
+        sales_forecast = self.head(combined)                        
         
-        sales_forecast = self.head(combined)                        # Continuous quantity [cite: 131]
-        zero_prob = torch.sigmoid(self.zero_gate(combined))         # Probability the item is selling [cite: 131]
-        
-        # Gated output drastically reduces false positives on intermittent items [cite: 131, 132]
-        return sales_forecast, zero_prob            
+        return sales_forecast
 
 
 class GraphTimeSeriesDataset(Dataset):
@@ -291,7 +271,6 @@ class LitSTGNNMixer(pl.LightningModule):
         super().__init__()
         self.model = model
         self.learning_rate = learning_rate
-        # Register the adjacency matrix as a PyTorch buffer
         self.register_buffer("adj_matrix", adj_matrix)
 
     def forward(self, x, x_future):
@@ -300,84 +279,101 @@ class LitSTGNNMixer(pl.LightningModule):
     def training_step(self, batch, _batch_idx):
         x, y_hist, x_future, y = batch
         
-        mean = y_hist.mean(dim=-1, keepdim=True)
-        var = y_hist.var(dim=-1, keepdim=True, unbiased=False)
+        # --- FP32 Armor ---
+        y_hist_fp32 = y_hist.float()
+        y_fp32 = y.float()
+        
+        mean = y_hist_fp32.mean(dim=-1, keepdim=True)
+        var = y_hist_fp32.var(dim=-1, keepdim=True, unbiased=False)
         std = torch.sqrt(var + 1e-5)
         
-        y_norm = (y - mean) / std
+        # Forward pass & Softplus
+        y_hat_norm = self(x, x_future)
+        y_hat_norm = y_hat_norm.float()
         
-        # 1. Unpack the tuple
-        y_hat_norm, zero_prob = self(x, x_future)
-        
-        # 2. Denormalize FIRST, then apply the zero-gate in raw space
         y_hat_raw = (y_hat_norm * std) + mean
-        y_hat = y_hat_raw * zero_prob
+        y_hat = F.softplus(y_hat_raw) 
         
-        y_clamp = y.clamp(min=0.0)
-        y_hat_clamp = y_hat.clamp(min=1e-3)
+        y_clamp = y_fp32.clamp(min=0.0)
 
-        primary_loss = F.mse_loss(torch.log1p(y_hat_clamp), torch.log1p(y_clamp))
+        # 1. Primary Loss (MSLE)
+        log_y = torch.log1p(y_clamp)
+        log_y_hat = torch.log1p(y_hat)
+        primary_loss = F.mse_loss(log_y_hat, log_y)
         
-        # Graph consistency loss uses the normalized latent trajectory
-        residuals = (y_norm - y_hat_norm)          
+        # 2. THE FIX: Graph Consistency Loss in LOG SPACE
+        # We calculate the residuals using the exact same log variables from above!
+        residuals = log_y - log_y_hat          
         res_mean = residuals.mean(dim=-1)          
         
         neighbor_res = torch.bmm(
-            self.adj_matrix.unsqueeze(0).expand(residuals.shape[0], -1, -1),
+            self.adj_matrix.float().unsqueeze(0).expand(residuals.shape[0], -1, -1),
             res_mean.unsqueeze(-1)
         ).squeeze(-1)
         
+        # Now both losses have the exact same gradient magnitude
         graph_loss = F.mse_loss(res_mean, neighbor_res.detach())
         loss = primary_loss + 0.1 * graph_loss
         
         self.log('train_loss', loss, prog_bar=True)
+        self.log('graph_consistency_loss', graph_loss, prog_bar=False)
         return loss
-        
 
     def validation_step(self, batch, _batch_idx):
         x, y_hist, x_future, y = batch
         
-        mean = y_hist.mean(dim=-1, keepdim=True)
-        # Robust fp16 standard deviation to prevent NaNs
-        var = y_hist.var(dim=-1, keepdim=True, unbiased=False)
+        # --- FP32 ARMOR ---
+        y_hist_fp32 = y_hist.float()
+        y_fp32 = y.float()
+        
+        mean = y_hist_fp32.mean(dim=-1, keepdim=True)
+        var = y_hist_fp32.var(dim=-1, keepdim=True, unbiased=False)
         std = torch.sqrt(var + 1e-5)
         
-        # 1. Unpack the tuple
-        y_hat_norm, zero_prob = self(x, x_future)
+        y_hat_norm = self(x, x_future)
         
-        # 2. Denormalize FIRST, then apply the zero-gate in raw space
+       # Upcast model outputs before denormalization
+        y_hat_norm = y_hat_norm.float()
+        
         y_hat_raw = (y_hat_norm * std) + mean
-        y_hat = y_hat_raw * zero_prob
         
-        # Same MSLE as training_step
-        y_clamp = y.clamp(min=0.0)
-        y_hat_clamp = y_hat.clamp(min=1e-3)
-        loss = F.mse_loss(torch.log1p(y_hat_clamp), torch.log1p(y_clamp))
+        # THE FIX 1: Smooth non-negativity. Softplus never has a dead gradient!
+        y_hat = F.softplus(y_hat_raw) 
         
+        y_clamp = y_fp32.clamp(min=0.0)
+
+        # THE FIX 2: Remove the gradient-killing clamp. 
+        # Softplus guarantees y_hat > 0, so log1p is perfectly safe.
+        loss = F.mse_loss(torch.log1p(y_hat), torch.log1p(y_clamp))
         self.log('val_loss', loss, prog_bar=True)
-        
-        # Keep raw MAE for human-readable monitoring only
-        val_mae_raw = F.l1_loss(y_hat, y)
-        self.log('val_mae_raw', val_mae_raw, prog_bar=False)
         return loss
     
     def test_step(self, batch, _batch_idx):
         x, y_hist, x_future, y = batch
         
-        mean = y_hist.mean(dim=-1, keepdim=True)
-        # Robust fp16 standard deviation to prevent NaNs
-        var = y_hist.var(dim=-1, keepdim=True, unbiased=False)
+        # --- FP32 ARMOR ---
+        y_hist_fp32 = y_hist.float()
+        y_fp32 = y.float()
+        
+        mean = y_hist_fp32.mean(dim=-1, keepdim=True)
+        var = y_hist_fp32.var(dim=-1, keepdim=True, unbiased=False)
         std = torch.sqrt(var + 1e-5)
         
-        # 1. Unpack the tuple
-        y_hat_norm, zero_prob = self(x, x_future)
+        y_hat_norm = self(x, x_future)
         
-        # 2. Denormalize FIRST, then apply the zero-gate in raw space
+        # Upcast model outputs before denormalization
+        y_hat_norm = y_hat_norm.float()
+        
         y_hat_raw = (y_hat_norm * std) + mean
-        y_hat = y_hat_raw * zero_prob
         
-        # Calculate loss against the RAW target
-        loss = F.huber_loss(y_hat, y)
+        # THE FIX 1: Smooth non-negativity. Softplus never has a dead gradient!
+        y_hat = F.softplus(y_hat_raw) 
+        
+        y_clamp = y_fp32.clamp(min=0.0)
+
+        # THE FIX 2: Remove the gradient-killing clamp. 
+        # Softplus guarantees y_hat > 0, so log1p is perfectly safe.
+        loss = F.mse_loss(torch.log1p(y_hat), torch.log1p(y_clamp))
         self.log('test_loss', loss, prog_bar=True)
         return loss
 
@@ -385,26 +381,16 @@ class LitSTGNNMixer(pl.LightningModule):
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
     
     def on_train_epoch_end(self):
-        # 1. Log Graph Alpha (Only if the core model has it!)
         if hasattr(self.model, 'graph_alpha'):
             alpha_val = torch.sigmoid(self.model.graph_alpha).item()
-            
             print(f"\n--- Epoch {self.current_epoch} End ---")
             print(f"Graph Alpha (Business vs. Latent): {alpha_val:.4f}")
-            
-            if alpha_val > 0.5:
-                print("Status: Model is leaning on your Supply Chain Hierarchy.")
-            else:
-                print("Status: Model is leaning on Discovered Latent Relationships.")
-            
             self.log("graph_alpha", alpha_val, prog_bar=True)
 
-        # 2. Extract Top-K Learned Connections (Only if the model has dynamic node embeddings!)
         if hasattr(self.model, 'static_node_emb'):
             with torch.no_grad():
                 learned_adj = torch.matmul(self.model.static_node_emb, self.model.static_node_emb.transpose(0, 1))
                 learned_adj = F.relu(learned_adj)
-                
                 for i in range(min(3, self.model.n_nodes)):
                     weights, indices = torch.topk(learned_adj[i], k=5)
                     print(f"SKU {i} Strongest Learned Links: Nodes {indices.tolist()} (Weights: {weights.tolist()})")

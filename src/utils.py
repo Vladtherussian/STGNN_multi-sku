@@ -2,32 +2,54 @@ import numpy as np
 import pandas as pd
 import torch
 
-def build_weighted_adjacency(static_df: pd.DataFrame, stat_exog_cols: list) -> torch.Tensor:
-    """
-    Builds a normalized, weighted adjacency matrix based on shared static attributes.
-    """
 
-    # static_df must be sorted in the exact same order as your unique_ids in the tensor
+def build_weighted_adjacency(static_df: pd.DataFrame, stat_exog_cols: list, volume_col: str = None) -> torch.Tensor:
+    """
+    Builds a normalized, weighted adjacency matrix based on shared static attributes,
+    using hierarchical weighting and a strict department mask for sparsity.
+    Optionally weights the edges by the target node's historical volume.
+    """
     n_nodes = len(static_df)
     adj_matrix = np.zeros((n_nodes, n_nodes))
     
-    # Iterate through every static category (store, item, dept, etc.)
-    for col in stat_exog_cols:
-        vals = static_df[col].values
-        
-        # Vectorized operation: Creates an N x N boolean matrix where [i, j] is True 
-        # if node i and node j share the exact same value for this category.
-        match_matrix = (vals[:, None] == vals[None, :]).astype(float)
-        
-        # Add it to the total adjacency matrix
-        adj_matrix += match_matrix
-        
-    # Optional but recommended: Graph Convolutions require normalized weights so 
-    # the feature values don't explode during matrix multiplication.
-    # We row-normalize the matrix so the sum of all connections for a single node equals 1.0.
-    row_sums = adj_matrix.sum(axis=1, keepdims=True)
+    weights = {
+        "item_id": 1.0,  
+        "dept_id": 0.5,  
+        "cat_id": 0.1,   
+    }
     
-    # Prevent division by zero just in case
+    for col in stat_exog_cols:
+        if col in weights:
+            vals = static_df[col].values
+            match_matrix = (vals[:, None] == vals[None, :]).astype(float)
+            adj_matrix += match_matrix * weights[col]
+            
+    # Hard Sparsity Mask
+    dept_vals = static_df['dept_id'].values
+    dept_mask = (dept_vals[:, None] == dept_vals[None, :]).astype(float)
+    adj_matrix = adj_matrix * dept_mask 
+
+    # --- NEW: GEOGRAPHIC FIREWALL (Store Mask) ---
+    # Strictly zero-out any connections between different physical locations
+    store_vals = static_df['store_id'].values
+    store_mask = (store_vals[:, None] == store_vals[None, :]).astype(float)
+    adj_matrix = adj_matrix * store_mask
+    
+    # --- NEW: VOLUME WEIGHTING ---
+    # If volume data is provided, scale the incoming edges by the node's volume
+    if volume_col and volume_col in static_df.columns:
+        volumes = static_df[volume_col].values
+        # Add a tiny constant (1e-5) so items with 0 average sales don't completely zero out their graph
+        volumes = np.clip(volumes, a_min=1e-5, a_max=None)
+        
+        # Multiply each column by the target node's volume
+        # This makes connections TO high-volume nodes stronger
+        # adj_matrix = adj_matrix * volumes[None, :]
+        volumes_norm = volumes / (volumes.max() + 1e-9)
+        adj_matrix = adj_matrix * volumes_norm[None, :]
+
+    # Row-normalize so graph convolutions don't explode
+    row_sums = adj_matrix.sum(axis=1, keepdims=True)
     row_sums[row_sums == 0] = 1.0 
     adj_matrix = adj_matrix / row_sums
     
@@ -35,7 +57,7 @@ def build_weighted_adjacency(static_df: pd.DataFrame, stat_exog_cols: list) -> t
 
 
 
-def calculate_m5_metrics(train_df, test_df, predictions_df, models, pred_len=28):
+def calculate_m5_metrics(train_df, test_df, predictions_df, models, raw_feature_sales, pred_len=28):
     """
     Calculates MAE, MSE, MASE, Bias, and a localized WRMSSE for a suite of models.
     
@@ -44,6 +66,15 @@ def calculate_m5_metrics(train_df, test_df, predictions_df, models, pred_len=28)
     predictions_df: The dataframe containing columns for each model's forecast
     models: List of string names of the models (e.g., ['TSMixerx', 'TFT', 'AutoARIMA'])
     """
+    raw_prices = raw_feature_sales[['id', 'timestamp', 'sell_price']].copy()
+    raw_prices.rename(columns={'id': 'unique_id', 'timestamp': 'ds'}, inplace=True)
+    train_df = train_df.merge(raw_prices, on=['unique_id', 'ds'], how='left')
+    
+    last_train = train_df.groupby('unique_id').tail(pred_len).copy()
+    
+    # Merge raw price on BOTH unique_id AND ds to avoid many-to-many join
+    last_train['revenue'] = last_train['y'] * last_train['sell_price']
+
     results = []
     
     # 1. Calculate the Scaling Factors (Denominators)
@@ -61,7 +92,8 @@ def calculate_m5_metrics(train_df, test_df, predictions_df, models, pred_len=28)
     # 2. Calculate the Revenue Weights (Numerator of WRMSSE)
     # Get the last pred_len days of the training set to calculate recent revenue
     last_train = train_df.groupby('unique_id').tail(pred_len).copy()
-    last_train['revenue'] = last_train['y'] * last_train['price']
+    # last_train = last_train.merge(raw_feature_sales[['id', 'timestamp', 'sell_price']], left_on=['unique_id', 'ds'], right_on=['id', 'timestamp'], how='left')
+    last_train['revenue'] = last_train['y'] * last_train['sell_price']
     
     weights = last_train.groupby('unique_id')['revenue'].sum().reset_index()
     total_revenue = weights['revenue'].sum()

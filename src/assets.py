@@ -9,6 +9,7 @@ import torch
 import numpy as np
 
 from dagster import asset, Config
+from window_ops.rolling import rolling_mean, rolling_std
 
 
 from .hybrid_model import VanillaSTGNN, VanillaSTGNNBlock
@@ -66,14 +67,14 @@ def load_sales_data(download_m5_data: str, config: SalesDataConfig) -> tuple:
         # reduce to only Foods and TX of first 100 per dept, per store
         # Gives exactly 1,437 nodes. Fits perfectly in 10GB VRAM.
         # Cross-Departmental
-        sales_train_df = sales_train_df.query("store_id == 'TX_1' & cat_id == 'FOODS'")
+        # sales_train_df = sales_train_df.query("store_id == 'TX_1' & cat_id == 'FOODS'")
 
         # Gives exactly 1,695 nodes. (565 Hobbies items x 3 Texas Stores)
         # Geographical Supply
         # sales_train_df = sales_train_df.query("cat_id == 'HOBBIES' & state_id == 'TX'")
 
         # Gives exactly 3,049 nodes. (rtx4090)
-        # sales_train_df = sales_train_df.query("store_id in ['TX_1']")
+        sales_train_df = sales_train_df.query("store_id in ['TX_1']")
 
         print("Number of selected items in evaluation set:", len(sales_train_df))
 
@@ -656,6 +657,144 @@ def train_hybrid_stgnn() -> None:
     print(f"STGNNMixer explicitly trained and saved to {model_dir}")
 
 
+@asset(deps=["prepare_ml_data", "prepare_stgnn_tensors"])
+def train_residual_stgnn() -> None:
+    """Trains the STGNN to specifically predict LightGBM's cross-validation residuals."""
+    import os
+    import torch
+    import pandas as pd
+    import numpy as np
+    import lightgbm as lgb
+    import pytorch_lightning as pl
+    from pytorch_lightning.callbacks import EarlyStopping
+    from torch.utils.data import DataLoader
+    from mlforecast import MLForecast
+    
+    # Import our new Residual Lightning Module
+    from .hybrid_model import STGNNMixer, LitResidualSTGNN, GraphTimeSeriesDataset
+    
+    # 1. Load Data
+    processed_dir = os.path.join(os.getcwd(), "data", "processed")
+    df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
+    payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
+    
+    X, adj = payload["X"], payload["adj"]
+    n_nodes, n_features = payload["n_nodes"], payload["n_features"]
+    futr_indices = payload["futr_indices"]
+    
+    # --- THE PERFORMANCE HACKS ---
+    seq_len = 14         # Slashed from 56 (Graph only needs recent error shocks)
+    pred_len = 28
+    hidden_features = 32 # Slashed from 64 (Residuals require less capacity)
+    batch_size = 32      # Increased from 8 (Maxes out the RTX 3080)
+    
+    all_dates = sorted(df["ds"].unique())
+    test_start_date = all_dates[-pred_len]
+    df_train = df[df["ds"] < test_start_date].copy()
+
+    # ---------------------------------------------------------
+    # THE FIX: Enforce exact feature parity with the baseline!
+    # ---------------------------------------------------------
+    futr_exog = ["price", "promo_depth", "is_weekend", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
+    futr_exog = futr_exog + [col for col in df.columns if col.startswith("month_name_") or col.startswith("weekday_")]
+    stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
+    
+    keep_cols = ['unique_id', 'ds', 'y'] + futr_exog + stat_exog
+    df_train = df_train[keep_cols].copy()
+    
+    # 2. Run MLForecast Cross-Validation
+    model = lgb.LGBMRegressor(
+        objective='tweedie', 
+        tweedie_variance_power=1.5, 
+        n_estimators=500, 
+        learning_rate=0.05, 
+        num_leaves=63, 
+        n_jobs=-1, 
+        random_state=42, 
+        verbose=-1
+    )
+   
+    fcst = MLForecast(
+            models={'LightGBM': model},
+            freq='D',
+            lags=[1, 2, 3, 7, 14], # Re-adds the recent lags you had to drop previously!
+            lag_transforms={
+                1: [(rolling_mean, 7), (rolling_std, 7), 
+                    (rolling_mean, 14), (rolling_std, 14),
+                    (rolling_mean, 28), (rolling_std, 28)]
+        }
+    )
+    
+    stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
+    print("Generating Out-Of-Fold Residuals via LightGBM CV...")
+    
+    # Using your exact snippet to get 140 days (5 windows * 28 days) of clean residuals
+    cv_results = fcst.cross_validation(
+        df=df_train,
+        h=pred_len,
+        n_windows=5, 
+        step_size=pred_len,
+        id_col='unique_id', time_col='ds', target_col='y', static_features=stat_exog
+    )
+    
+    cv_results['residual'] = cv_results['y'] - cv_results['LightGBM']
+    
+    # 3. Pivot Residuals to match Tensor Shape [Nodes, Time]
+    cv_residuals = cv_results[['unique_id', 'ds', 'residual']]
+    residual_pivot = cv_residuals.pivot(index='unique_id', columns='ds', values='residual')
+    
+    # 4. TENSOR ALIGNMENT MAGIC
+    # Find the exact 140 days in the main dataset, and slice the X tensor to match!
+    cv_dates = sorted(cv_residuals['ds'].unique())
+    all_dates_list = list(all_dates)
+    start_idx = all_dates_list.index(cv_dates[0])
+    end_idx = all_dates_list.index(cv_dates[-1]) + 1
+    
+    X_cv = X[:, start_idx:end_idx, :]
+    y_res_cv = torch.tensor(residual_pivot.values, dtype=torch.float32)
+    
+    print(f"Aligned Tensors -> X: {X_cv.shape}, Residuals: {y_res_cv.shape}")
+    
+    # 5. Temporal Train/Val Split (on the 140 days of residuals)
+    val_split_idx = X_cv.shape[1] - pred_len
+    X_train, y_train = X_cv[:, :val_split_idx, :], y_res_cv[:, :val_split_idx]
+    X_val, y_val = X_cv[:, -seq_len - pred_len:, :], y_res_cv[:, -seq_len - pred_len:]
+    
+    train_dataset = GraphTimeSeriesDataset(X_train, y_train, seq_len, pred_len, futr_indices)
+    val_dataset = GraphTimeSeriesDataset(X_val, y_val, seq_len, pred_len, futr_indices)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    
+    # 6. Ignite the Hybrid Model
+    core_model = STGNNMixer(
+        seq_len=seq_len, 
+        pred_len=pred_len, 
+        n_nodes=n_nodes, 
+        in_features=1,  # <--- THE FIX: The model now expects ONLY 1 historical feature (the residual)!
+        hidden_features=hidden_features, 
+        n_futr_features=len(futr_indices)
+    )
+    
+    lit_model = LitResidualSTGNN(model=core_model, adj_matrix=adj)
+    
+    # NOTE: PyTorch 2.0 Compilation (Uncomment if you transition to a Linux environment. It is finicky on Windows!)
+    # lit_model = torch.compile(lit_model) 
+    
+    early_stop_callback = EarlyStopping(monitor="val_loss", patience=2, mode="min")
+    trainer = pl.Trainer(max_epochs=50, callbacks=[early_stop_callback], accelerator="auto", precision="16-mixed")
+    
+    print("Igniting Residual STGNN Engine...")
+    trainer.fit(lit_model, train_loader, val_loader)
+    
+    # Save Weights
+    model_dir = os.path.join(os.getcwd(), "data", "models", "residual_stgnn")
+    os.makedirs(model_dir, exist_ok=True)
+    torch.save(lit_model.state_dict(), os.path.join(model_dir, "weights.pt"))
+    print(f"Residual Model saved to {model_dir}")
+
+
+
 # @asset(deps=["prepare_stgnn_tensors"])
 # def train_vanilla_stgnn() -> None:
 #     """Trains the Vanilla STGNN baseline to compare against the Mixer."""
@@ -925,7 +1064,8 @@ def train_statistical_baselines() -> None:
     "train_ablation_no_graph", 
     "train_ablation_static_graph",
     "train_vanilla_stgnn",
-    "train_lightgbm_baseline"
+    "train_lightgbm_baseline",
+    "train_residual_stgnn"
 ])
 def evaluate_benchmark() -> None:
     import pandas as pd
@@ -1076,6 +1216,68 @@ def evaluate_benchmark() -> None:
     # else:
     #     print("Skipping VanillaSTGNN because weights were not found.")
 
+    # ---------------------------------------------------------
+    # 🔥 THE NAIVE ENSEMBLE (50/50 Average) 🔥
+    # ---------------------------------------------------------
+    if "LightGBM" in all_preds.columns and "STGNNMixer" in all_preds.columns:
+        all_preds["Hybrid_Ensemble"] = (all_preds["LightGBM"] * 0.5) + (all_preds["STGNNMixer"] * 0.5)
+
+    # ---------------------------------------------------------
+    # 🚀 THE TRUE TWO-STAGE RESIDUAL HYBRID 🚀
+    # ---------------------------------------------------------
+    residual_weights_path = os.path.join(os.getcwd(), "data", "models", "residual_stgnn", "weights.pt")
+    
+    if os.path.exists(residual_weights_path) and "LightGBM" in all_preds.columns:
+        print("\nEvaluating True Two-Stage Hybrid (LightGBM + Residual STGNN)...")
+        from .hybrid_model import LitResidualSTGNN
+        
+        # Apply the exact performance hacks used during training
+        res_seq_len = 14
+        
+        state_dict = torch.load(residual_weights_path)
+        res_hidden_features = state_dict['model.static_node_emb'].shape[1]
+        
+        core_res_model = STGNNMixer(
+            seq_len=res_seq_len, 
+            pred_len=pred_len, 
+            n_nodes=n_nodes, 
+            in_features=1, # The Pure Approach: Only 1 historical feature!
+            hidden_features=res_hidden_features, 
+            n_futr_features=len(futr_indices)
+        )
+        
+        lit_res_model = LitResidualSTGNN(model=core_res_model, adj_matrix=adj.to(device))
+        lit_res_model.load_state_dict(state_dict)
+        lit_res_model.to(device)
+        lit_res_model.eval()
+        
+        with torch.no_grad():
+            # 1. Slice the last 14 days of raw sales
+            y_hist_14 = y[:, test_start_idx - res_seq_len : test_start_idx].unsqueeze(0).to(device)
+            
+            # 2. INFERENCE HACK: Approximate LightGBM's historical baseline by mean-centering.
+            # This turns raw sales into "recent shock residuals" for the graph to route.
+            y_hist_14_mean = y_hist_14.mean(dim=-1, keepdim=True)
+            pure_x_inference = (y_hist_14 - y_hist_14_mean).unsqueeze(-1).float() # Shape: [1, N, 14, 1]
+            
+            # 3. Predict the future spatial errors
+            # (No FP32 armor, no denormalization, no Softplus! It outputs raw +/- residuals)
+            y_hat_residual = lit_res_model(pure_x_inference, x_future)
+        
+        y_hat_res_cpu = y_hat_residual.squeeze(0).cpu().numpy()
+        
+        # 4. Format into a dataframe
+        res_records = []
+        for i, uid in enumerate(ordered_unique_ids):
+            for j, date in enumerate(test_dates):
+                res_records.append({"unique_id": uid, "ds": date, "STGNN_Residual": y_hat_res_cpu[i, j]})
+                
+        res_preds = pd.DataFrame(res_records)
+        all_preds = all_preds.merge(res_preds, on=["unique_id", "ds"], how="inner")
+        
+        # 5. THE MAGIC: Add the STGNN spatial error back to the LightGBM temporal baseline!
+        all_preds["TwoStage_Hybrid"] = all_preds["LightGBM"] + all_preds["STGNN_Residual"]
+
     # Force all prediction columns to be 0 or higher
     model_cols = [col for col in all_preds.columns if col not in ['unique_id', 'ds', 'y']]
     all_preds[model_cols] = all_preds[model_cols].clip(lower=0.0)
@@ -1101,19 +1303,27 @@ def evaluate_benchmark() -> None:
     
     # Update the names list to include your ablations
     model_names = ["AutoARIMA", "AutoETS", "TSMixerx", "TFT", "NHITS", "STGNNMixer", 
-                   "STGNN_StaticGraph", "STGNN_NoGraph", "VanillaSTGNN", "LightGBM", "Hybrid_Ensemble" ]
+                   "STGNN_StaticGraph", "STGNN_NoGraph", "VanillaSTGNN", "LightGBM", "Hybrid_Ensemble", "TwoStage_Hybrid" ]
     
     
     
     # Filter the list down to models that actually exist in the dataframe
     model_names = [m for m in model_names if m in all_preds.columns]
     
-    results_df = calculate_m5_metrics(train_df, test_df, all_preds, model_names, raw_feature_sales, pred_len)
+    results_df, grouped_metrics = calculate_m5_metrics(train_df, test_df, all_preds, model_names, raw_feature_sales, pred_len)
+    
+    grouped_metrics_pivoted = pd.pivot_table(grouped_metrics, values = "value", index=["dept_name", "Model"], columns="metric", aggfunc="mean").sort_values(by="weighted_rmsse")
     
     print("\n" + "="*80)
     print("🏆 FINAL FORECASTING TOURNAMENT LEADERBOARD 🏆")
     print("="*80)
     print(results_df.to_string(index=False))
+    print("="*80 + "\n")
+
+    print("\n" + "="*80)
+    print("📊 CATEGORY-LEVEL METRICS 📊")
+    print("="*80)
+    print(grouped_metrics_pivoted.to_string())
     print("="*80 + "\n")
 
     # ---------------------------------------------------------

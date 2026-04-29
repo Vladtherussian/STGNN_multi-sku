@@ -395,6 +395,70 @@ class LitSTGNNMixer(pl.LightningModule):
                     weights, indices = torch.topk(learned_adj[i], k=5)
                     print(f"SKU {i} Strongest Learned Links: Nodes {indices.tolist()} (Weights: {weights.tolist()})")
 
+
+class LitResidualSTGNN(pl.LightningModule):
+    """
+    Dedicated Lightning wrapper for the Residual Two-Stage Model. 
+    Now features a self-learning shrinkage parameter to automatically 
+    calibrate the magnitude of the spatial corrections!
+    """
+    def __init__(self, model, adj_matrix, learning_rate=1e-3):
+        super().__init__()
+        self.model = model
+        self.learning_rate = learning_rate
+        self.register_buffer("adj_matrix", adj_matrix)
+        
+        # THE ELEGANT FIX: A learnable parameter for the residual scale.
+        # We initialize it at 0.1 so the model starts cautious, 
+        # but the optimizer will push this up or down automatically!
+        self.learned_shrinkage = nn.Parameter(torch.ones(1, model.n_nodes, 1) * 0.1)
+
+    def forward(self, pure_x, x_future):
+        # The core model predicts the raw spatial shock
+        raw_residual = self.model(pure_x, x_future, self.adj_matrix)
+        
+        # The network scales its own prediction before outputting it!
+        return raw_residual * self.learned_shrinkage
+
+    def training_step(self, batch, _batch_idx):
+        x, y_hist, x_future, y_residual = batch
+        
+        # The Pure Residual Hack
+        pure_x = y_hist.unsqueeze(-1) 
+        
+        # Forward pass (Now natively scaled by the learned shrinkage!)
+        y_hat_residual = self(pure_x, x_future)
+        
+        loss = F.mse_loss(y_hat_residual, y_residual)
+        self.log('train_loss', loss, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, _batch_idx):
+        x, y_hist, x_future, y_residual = batch
+        pure_x = y_hist.unsqueeze(-1)
+        
+        y_hat_residual = self(pure_x, x_future)
+        loss = F.mse_loss(y_hat_residual, y_residual)
+        self.log('val_loss', loss, prog_bar=True)
+        return loss
+
+    def configure_optimizers(self):
+        # We still keep a tiny bit of weight decay to keep the core graph weights healthy
+        return torch.optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=1e-5)
+        
+    def on_train_epoch_end(self):
+        # Calculate aggregate metrics of the shrinkage vector without tracking gradients
+        with torch.no_grad():
+            mean_shrinkage = self.learned_shrinkage.mean().item()
+            max_shrinkage = self.learned_shrinkage.max().item()
+            min_shrinkage = self.learned_shrinkage.min().item()
+            
+        print(f"\n--- Epoch {self.current_epoch} End ---")
+        print(f"Shrinkage Vector -> Mean: {mean_shrinkage:.4f} | Max: {max_shrinkage:.4f} | Min: {min_shrinkage:.4f}")
+        
+        # Log the mean to the progress bar so you can still track it
+        self.log("shrinkage_mean", mean_shrinkage, prog_bar=True)
+
 class VanillaSTGNNBlock(nn.Module):
     """
     A classic Spatio-Temporal block using a GRU for time and GCN for space.

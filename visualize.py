@@ -15,14 +15,19 @@ def plot_multiple_forecasts(num_items=10):
     # 2. Select the items to visualize
     # Grab the first 10 unique items (you can randomize this or slice it differently)
     unique_items = df['unique_id'].unique()
-    target_items = unique_items[:num_items]
+    target_items = unique_items[1000:1010]
 
     # Filter down to just our targeted SKUs
     plot_df = df[df['unique_id'].isin(target_items)]
 
     # 3. Reshape the data for Plotly Express
     # Notice we keep 'unique_id' as an id_var so Plotly knows how to split the facets
-    models_to_plot = ['y', 'AutoARIMA', 'AutoETS', 'TSMixerx', 'TFT', 'NHITS', 'STGNNMixer']
+    models_to_plot = ['y', 
+                    #   'AutoARIMA', 'AutoETS', 
+                    #   'TSMixerx', 'TFT', 'NHITS', 
+                      'STGNNMixer', 'LightGBM',
+                    #   'STGNN_StaticGraph','STGNN_NoGraph'
+                      ]
     
     plot_df_melted = plot_df.melt(
         id_vars=['ds', 'unique_id'], 
@@ -44,8 +49,11 @@ def plot_multiple_forecasts(num_items=10):
         color_discrete_map={
             'y': 'black',
             'STGNNMixer': 'red',
-            'AutoARIMA': 'lightblue',
-            'AutoETS': 'lightgreen',
+            # 'AutoARIMA': 'lightblue',
+            # 'AutoETS': 'lightgreen',
+            'STGNN_NoGraph': 'green',
+            'STGNN_StaticGraph': 'cyan',
+            'LightGBM': 'blue',
             'TSMixerx': 'orange',
             'TFT': 'purple',
             'NHITS': 'pink'
@@ -72,4 +80,4 @@ def plot_multiple_forecasts(num_items=10):
     fig.show()
 
 if __name__ == "__main__":
-    plot_multiple_forecasts(num_items=10)
+    plot_multiple_forecasts(num_items=30)

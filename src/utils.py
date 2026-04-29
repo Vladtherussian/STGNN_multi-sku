@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import pandas as pd
 import torch
@@ -101,7 +103,9 @@ def calculate_m5_metrics(train_df, test_df, predictions_df, models, raw_feature_
     
     # Merge test data with predictions
     eval_df = test_df[['unique_id', 'ds', 'y']].merge(predictions_df, on=['unique_id', 'ds'], how='inner')
-    
+    item_results = pd.DataFrame()  # To store item-level metrics for analysis
+    grouped_metrics = pd.DataFrame()  # To store category-level metrics for analysis
+
     for model in models:
         # Calculate Absolute Error and Squared Error per row
         eval_df['ae'] = (eval_df['y'] - eval_df[model]).abs()
@@ -125,6 +129,32 @@ def calculate_m5_metrics(train_df, test_df, predictions_df, models, raw_feature_
         
         # Calculate MASE per item
         item_metrics['mase'] = item_metrics['ae'] / (item_metrics['scale_mase'] + 1e-9)
+
+        #======================
+        # Category Calculation
+        #======================
+        eval_df['dept_name'] = eval_df['unique_id'].str.split("_", expand=True)[0]
+        # wrmsse per category        
+        item_metrics['dept_name'] = item_metrics['unique_id'].str.split("_", expand=True)[0]
+        item_metrics['weighted_rmsse'] = item_metrics['rmsse'] * item_metrics['weight']
+        group_wrmsse = item_metrics.groupby('dept_name')['weighted_rmsse'].sum().reset_index()\
+            .rename(columns={'weighted_rmsse': 'value'}).assign(metric='weighted_rmsse', Model=model)
+
+        # MAE
+        group_mae = eval_df.groupby('dept_name', as_index=False)['ae'].mean().rename(columns={'ae': 'value'}).assign(metric='mae', Model=model)
+
+        # MASE
+        group_mase = item_metrics.groupby('dept_name', as_index=False)['mase'].mean().rename(columns={'mase': 'value'}).assign(metric='mase', Model=model)
+
+        # MSE
+        group_mse = eval_df.groupby('dept_name', as_index=False)['se'].mean().rename(columns={'se': 'value'}).assign(metric='mse', Model=model)
+
+        # category bias: average bias per category (e.g., dept_id)
+        group_bias = eval_df.groupby('dept_name', as_index=False).apply(lambda x: (x[model].sum() - x['y'].sum()) / (x['y'].sum() + 1e-9))\
+            .rename(columns={None: 'value'}).assign(metric='bias', Model=model)
+
+        grouped_metrics = pd.concat([grouped_metrics, group_wrmsse, group_mae, group_mase, group_mse, group_bias], ignore_index=True)
+        item_results = pd.concat([item_results, item_metrics.assign(Model=model)], ignore_index=True)  # Append model name for analysis
         
         # Aggregate global metrics
         wrmsse = (item_metrics['rmsse'] * item_metrics['weight']).sum()
@@ -140,5 +170,9 @@ def calculate_m5_metrics(train_df, test_df, predictions_df, models, raw_feature_
             'WRMSSE': wrmsse,
             'Bias': bias
         })
+    pred_dir = os.path.join(os.getcwd(), "data", "predictions")
+    os.makedirs(pred_dir, exist_ok=True)
+    item_results.to_csv(os.path.join(pred_dir, f"item_metrics_all_models.csv"), index=False)  # Save item-level metrics for analysis
+    grouped_metrics.to_csv(os.path.join(pred_dir, f"category_metrics_all_models.csv"), index=False)  # Save category-level metrics for analysis
         
-    return pd.DataFrame(results).sort_values('WRMSSE')
+    return pd.DataFrame(results).sort_values('WRMSSE'), grouped_metrics.sort_values(['dept_name', 'Model', 'metric'])

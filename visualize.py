@@ -15,7 +15,7 @@ def plot_multiple_forecasts(num_items=10):
     # 2. Select the items to visualize
     # Grab the first 10 unique items (you can randomize this or slice it differently)
     unique_items = df['unique_id'].unique()
-    target_items = unique_items[1000:1010]
+    target_items = unique_items[70:80]
 
     # Filter down to just our targeted SKUs
     plot_df = df[df['unique_id'].isin(target_items)]
@@ -24,9 +24,10 @@ def plot_multiple_forecasts(num_items=10):
     # Notice we keep 'unique_id' as an id_var so Plotly knows how to split the facets
     models_to_plot = ['y', 
                     #   'AutoARIMA', 'AutoETS', 
-                    #   'TSMixerx', 'TFT', 'NHITS', 
+                      'TSMixerx', 'TFT', 'NHITS', 
                       'STGNNMixer', 'LightGBM',
                     #   'STGNN_StaticGraph','STGNN_NoGraph'
+                      'Hybrid_Ensemble'
                       ]
     
     plot_df_melted = plot_df.melt(
@@ -56,7 +57,8 @@ def plot_multiple_forecasts(num_items=10):
             'LightGBM': 'blue',
             'TSMixerx': 'orange',
             'TFT': 'purple',
-            'NHITS': 'pink'
+            'NHITS': 'pink',
+            'Hybrid_Ensemble': 'brown'
         },
         height=1500  # Make the canvas very tall to fit all the charts comfortably
     )

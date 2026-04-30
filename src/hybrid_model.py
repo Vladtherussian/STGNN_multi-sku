@@ -296,13 +296,18 @@ class LitSTGNNMixer(pl.LightningModule):
         
         y_clamp = y_fp32.clamp(min=0.0)
 
-        # 1. Primary Loss (MSLE)
+        # ==========================================
+        # 1. THE FIX: Poisson Loss for the Primary Objective
+        # ==========================================
+        # log_input=False tells PyTorch our network is already outputting raw positive values (thanks to Softplus)
+        primary_loss = F.poisson_nll_loss(y_hat, y_clamp, log_input=False)
+        
+        # 2. Graph Consistency Loss (Kept in Log Space for Magnitude Stability)
+        # We still use log1p here strictly so the magnitude of this regularization 
+        # doesn't explode and ruin the 0.1 scaling weight.
         log_y = torch.log1p(y_clamp)
         log_y_hat = torch.log1p(y_hat)
-        primary_loss = F.mse_loss(log_y_hat, log_y)
         
-        # 2. THE FIX: Graph Consistency Loss in LOG SPACE
-        # We calculate the residuals using the exact same log variables from above!
         residuals = log_y - log_y_hat          
         res_mean = residuals.mean(dim=-1)          
         
@@ -311,9 +316,8 @@ class LitSTGNNMixer(pl.LightningModule):
             res_mean.unsqueeze(-1)
         ).squeeze(-1)
         
-        # Now both losses have the exact same gradient magnitude
         graph_loss = F.mse_loss(res_mean, neighbor_res.detach())
-        loss = primary_loss + 0.1 * graph_loss
+        loss = primary_loss + (0.1 * graph_loss)
         
         self.log('train_loss', loss, prog_bar=True)
         self.log('graph_consistency_loss', graph_loss, prog_bar=False)
@@ -331,20 +335,15 @@ class LitSTGNNMixer(pl.LightningModule):
         std = torch.sqrt(var + 1e-5)
         
         y_hat_norm = self(x, x_future)
-        
-       # Upcast model outputs before denormalization
         y_hat_norm = y_hat_norm.float()
         
         y_hat_raw = (y_hat_norm * std) + mean
-        
-        # THE FIX 1: Smooth non-negativity. Softplus never has a dead gradient!
         y_hat = F.softplus(y_hat_raw) 
         
         y_clamp = y_fp32.clamp(min=0.0)
 
-        # THE FIX 2: Remove the gradient-killing clamp. 
-        # Softplus guarantees y_hat > 0, so log1p is perfectly safe.
-        loss = F.mse_loss(torch.log1p(y_hat), torch.log1p(y_clamp))
+        # Track Poisson Loss in Validation as well
+        loss = F.poisson_nll_loss(y_hat, y_clamp, log_input=False)
         self.log('val_loss', loss, prog_bar=True)
         return loss
     
@@ -360,20 +359,15 @@ class LitSTGNNMixer(pl.LightningModule):
         std = torch.sqrt(var + 1e-5)
         
         y_hat_norm = self(x, x_future)
-        
-        # Upcast model outputs before denormalization
         y_hat_norm = y_hat_norm.float()
         
         y_hat_raw = (y_hat_norm * std) + mean
-        
-        # THE FIX 1: Smooth non-negativity. Softplus never has a dead gradient!
         y_hat = F.softplus(y_hat_raw) 
         
         y_clamp = y_fp32.clamp(min=0.0)
 
-        # THE FIX 2: Remove the gradient-killing clamp. 
-        # Softplus guarantees y_hat > 0, so log1p is perfectly safe.
-        loss = F.mse_loss(torch.log1p(y_hat), torch.log1p(y_clamp))
+        # Track Poisson Loss in Test as well
+        loss = F.poisson_nll_loss(y_hat, y_clamp, log_input=False)
         self.log('test_loss', loss, prog_bar=True)
         return loss
 

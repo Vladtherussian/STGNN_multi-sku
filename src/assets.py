@@ -67,14 +67,14 @@ def load_sales_data(download_m5_data: str, config: SalesDataConfig) -> tuple:
         # reduce to only Foods and TX of first 100 per dept, per store
         # Gives exactly 1,437 nodes. Fits perfectly in 10GB VRAM.
         # Cross-Departmental
-        # sales_train_df = sales_train_df.query("store_id == 'TX_1' & cat_id == 'FOODS'")
+        sales_train_df = sales_train_df.query("store_id == 'TX_1' & cat_id == 'FOODS'")
 
         # Gives exactly 1,695 nodes. (565 Hobbies items x 3 Texas Stores)
         # Geographical Supply
         # sales_train_df = sales_train_df.query("cat_id == 'HOBBIES' & state_id == 'TX'")
 
         # Gives exactly 3,049 nodes. (rtx4090)
-        sales_train_df = sales_train_df.query("store_id in ['TX_1']")
+        # sales_train_df = sales_train_df.query("store_id in ['TX_1']")
 
         print("Number of selected items in evaluation set:", len(sales_train_df))
 
@@ -495,10 +495,10 @@ def train_lightgbm_baseline() -> None:
     pred_len = 28
     all_dates = sorted(df["ds"].unique())
     # NEW CORRECT WAY: LightGBM stops training 56 days before the end, exactly like the STGNN
-    val_start_date = all_dates[-(pred_len * 2)]
+    # val_start_date = all_dates[-(pred_len * 2)]
     test_start_date = all_dates[-pred_len]
     
-    df_train = df[df["ds"] < val_start_date].copy()
+    df_train = df[df["ds"] < test_start_date].copy()
     # df_test = df[df["ds"] >= test_start_date].copy()
     
     # 1. Define Exogenous Features
@@ -538,31 +538,12 @@ def train_lightgbm_baseline() -> None:
     )
     
     print("Igniting Recursive LightGBM Baseline...")
-    
-    # Fit the model. static_features tells LightGBM exactly which columns are categories!
     fcst.fit(df_train, id_col='unique_id', time_col='ds', target_col='y', static_features=stat_exog)
     
-    # FIX: df_train ends at val_start_date-1, so MLForecast's h=1 lands on val_start_date.
-    # We need to step through both the val window AND the test window to reach
-    # the test predictions — that's h = pred_len * 2 = 56 total steps.
-    # X_df must therefore cover all 56 future dates, not just the test 28.
-    df_future = df[df["ds"] >= val_start_date][['unique_id', 'ds'] + futr_exog].copy()
+    # THE FIX: We only need to predict the final 28 days (h=28)
+    df_future = df[df["ds"] >= test_start_date][['unique_id', 'ds'] + futr_exog].copy()
     
-    # Sanity check: every unique_id must have exactly h rows in X_df,
-    # otherwise MLForecast raises the "missing inputs" error you saw.
-    h = pred_len * 2  # 56
-    expected_rows = df_train['unique_id'].nunique() * h
-    actual_rows   = len(df_future)
-    assert actual_rows == expected_rows, (
-        f"X_df has {actual_rows} rows but expected {expected_rows}. "
-        f"Run fcst.get_missing_future({h}, df_future) to inspect gaps."
-    )
-
-    predictions = fcst.predict(h=h, X_df=df_future)
-
-    # Keep only the test window (last pred_len dates per series)
-    # The first pred_len rows per id are the val-window predictions — discard them
-    predictions = predictions[predictions['ds'] >= test_start_date].copy()
+    predictions = fcst.predict(h=pred_len, X_df=df_future)
 
     out_dir = os.path.join(os.getcwd(), "data", "predictions")
     os.makedirs(out_dir, exist_ok=True)
@@ -1006,56 +987,56 @@ def train_statistical_baselines() -> None:
     predictions.to_parquet(os.path.join(out_dir, "stats_predictions.parquet"), index=False)
     print("Statistical baseline predictions saved.")
 
-# @asset(deps=["prepare_ml_data"])
-# def train_deep_baselines() -> None:
-#     """Trains deep learning benchmarks (TSMixerx, TFT, NHITS) on the GPU."""
-#     from neuralforecast import NeuralForecast
-#     from neuralforecast.models import TSMixerx, TFT, NHITS
+@asset(deps=["prepare_ml_data"])
+def train_deep_baselines() -> None:
+    """Trains deep learning benchmarks (TSMixerx, TFT, NHITS) on the GPU."""
+    from neuralforecast import NeuralForecast
+    from neuralforecast.models import TSMixerx, TFT, NHITS
     
-#     processed_dir = os.path.join(os.getcwd(), "data", "processed")
-#     df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
+    processed_dir = os.path.join(os.getcwd(), "data", "processed")
+    df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
     
-#     n_series = df["unique_id"].nunique()
-#     pred_len = 28
+    n_series = df["unique_id"].nunique()
+    pred_len = 28
     
-#     all_dates = sorted(df["ds"].unique())
-#     test_start_date = all_dates[-pred_len]
-#     df_train_val = df[df["ds"] < test_start_date].copy()
-#     df_test = df[df["ds"] >= test_start_date].copy()
+    all_dates = sorted(df["ds"].unique())
+    test_start_date = all_dates[-pred_len]
+    df_train_val = df[df["ds"] < test_start_date].copy()
+    df_test = df[df["ds"] >= test_start_date].copy()
     
-#     stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
-#     futr_exog = ["price", "promo_depth", "is_weekend", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
-#     futr_exog = futr_exog + [col for col in df.columns if col.startswith("month_name_") or col.startswith("weekday_")]
+    stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
+    futr_exog = ["price", "promo_depth", "is_weekend", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
+    futr_exog = futr_exog + [col for col in df.columns if col.startswith("month_name_") or col.startswith("weekday_")]
 
-#     # Drop the Deep Learning specific recent lags to prevent leakage
-#     df_numeric = df.select_dtypes(include=[np.number])
-#     lgb_cols = [col for col in df_numeric.columns if col.startswith("lgb_") or col in ["sales_lag_28", "sales_lag_35", "sales_lag_42", "sales_lag_56"]]
-#     df_numeric = df_numeric.drop(columns=lgb_cols)
+    # Drop the Deep Learning specific recent lags to prevent leakage
+    df_numeric = df.select_dtypes(include=[np.number])
+    lgb_cols = [col for col in df_numeric.columns if col.startswith("lgb_") or col in ["sales_lag_28", "sales_lag_35", "sales_lag_42", "sales_lag_56"]]
+    df_numeric = df_numeric.drop(columns=lgb_cols)
 
-#     hist_exog = [col for col in df_numeric.columns if 'lag' in col or 'mean' in col or 'std' in col or 'roll_sum' in col]
+    hist_exog = [col for col in df_numeric.columns if 'lag' in col or 'mean' in col or 'std' in col or 'roll_sum' in col]
 
-#     # Initialize all models (keeping max_steps low for quick execution on your local rig)
-#     models = [
-#         TSMixerx(h=pred_len, input_size=pred_len*2, n_series=n_series, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100),
-#         TFT(h=pred_len, input_size=pred_len*2, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100),
-#         NHITS(h=pred_len, input_size=pred_len*2, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100)
-#     ]
+    # Initialize all models (keeping max_steps low for quick execution on your local rig)
+    models = [
+        TSMixerx(h=pred_len, input_size=pred_len*2, n_series=n_series, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100),
+        TFT(h=pred_len, input_size=pred_len*2, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100),
+        NHITS(h=pred_len, input_size=pred_len*2, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100)
+    ]
     
-#     nf = NeuralForecast(models=models, freq='D')
-#     static_df = df_train_val[["unique_id"] + stat_exog].drop_duplicates()
+    nf = NeuralForecast(models=models, freq='D')
+    static_df = df_train_val[["unique_id"] + stat_exog].drop_duplicates()
     
-#     print("Igniting Deep Learning Baselines (TSMixerx, TFT, NHITS)...")
-#     nf.fit(df=df_train_val, static_df=static_df, val_size=pred_len)
+    print("Igniting Deep Learning Baselines (TSMixerx, TFT, NHITS)...")
+    nf.fit(df=df_train_val, static_df=static_df, val_size=pred_len)
     
-#     # Generate test predictions
-#     futr_df = df_test[['unique_id', 'ds'] + futr_exog]
-#     predictions = nf.predict(df=df_train_val, static_df=static_df, futr_df=futr_df)
-#     predictions = predictions.reset_index()
+    # Generate test predictions
+    futr_df = df_test[['unique_id', 'ds'] + futr_exog]
+    predictions = nf.predict(df=df_train_val, static_df=static_df, futr_df=futr_df)
+    predictions = predictions.reset_index()
     
-#     out_dir = os.path.join(os.getcwd(), "data", "predictions")
-#     os.makedirs(out_dir, exist_ok=True)
-#     predictions.to_parquet(os.path.join(out_dir, "deep_predictions.parquet"), index=False)
-#     print("Deep learning predictions saved.")
+    out_dir = os.path.join(os.getcwd(), "data", "predictions")
+    os.makedirs(out_dir, exist_ok=True)
+    predictions.to_parquet(os.path.join(out_dir, "deep_predictions.parquet"), index=False)
+    print("Deep learning predictions saved.")
 
 @asset(deps=[
     "train_statistical_baselines", 
@@ -1321,7 +1302,7 @@ def evaluate_benchmark() -> None:
     print("="*80 + "\n")
 
     print("\n" + "="*80)
-    print("📊 CATEGORY-LEVEL METRICS 📊")
+    print("📊 CATEGORY-LEVEL METRICS Global Error Attribution (WRMSSE)📊")
     print("="*80)
     print(grouped_metrics_pivoted.to_string())
     print("="*80 + "\n")

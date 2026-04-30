@@ -6034,6 +6034,25 @@ files = [
 ]
 
 [[package]]
+name = "window-ops"
+version = "0.0.15"
+description = "Implementations of window operations such as rolling and expanding."
+optional = false
+python-versions = ">=3.6"
+groups = ["main"]
+files = [
+    {file = "window_ops-0.0.15-py3-none-any.whl", hash = "sha256:7dbd18b467939ac5db3f6834c07e7ffb723691f5d86c22a39e707713d8ac86e3"},
+    {file = "window_ops-0.0.15.tar.gz", hash = "sha256:3c762d35a38d562f34cda33a272ced2c8d5dd88bd050c13bc82a592cf668a535"},
+]
+
+[package.dependencies]
+numba = "*"
+numpy = "*"
+
+[package.extras]
+dev = ["pandas"]
+
+[[package]]
 name = "xxhash"
 version = "3.6.0"
 description = "Python binding for xxHash"
@@ -6344,4 +6363,4 @@ termcolor = ">=3.2,<4.0"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12, <3.13"
-content-hash = "80cd7e05c444088001e187353901434ae8c7ad0414742f19341904ebe4919b62"
+content-hash = "b6cf5b1abb8683821ef6a3c9a36f1158988f4667a355c5028e56f1da9399f795"

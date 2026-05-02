@@ -10,7 +10,7 @@ import numpy as np
 
 from dagster import asset, Config
 from window_ops.rolling import rolling_mean, rolling_std
-
+from .utils import build_correlation_adjacency
 
 from .hybrid_model import VanillaSTGNN, VanillaSTGNNBlock
 from pathlib import Path
@@ -21,7 +21,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
-from .utils import build_weighted_adjacency
+from .utils import build_correlation_adjacency
 
 # 1. Define a Config class for your parameters
 class SalesDataConfig(Config):
@@ -67,7 +67,7 @@ def load_sales_data(download_m5_data: str, config: SalesDataConfig) -> tuple:
         # reduce to only Foods and TX of first 100 per dept, per store
         # Gives exactly 1,437 nodes. Fits perfectly in 10GB VRAM.
         # Cross-Departmental
-        sales_train_df = sales_train_df.query("store_id == 'TX_1' & cat_id == 'FOODS'")
+        sales_train_df = sales_train_df.query("store_id in ('TX_1') & cat_id == 'HOUSEHOLD'")
 
         # Gives exactly 1,695 nodes. (565 Hobbies items x 3 Texas Stores)
         # Geographical Supply
@@ -169,6 +169,34 @@ def feature_engineering() -> pd.DataFrame:
         feature_name = f"sales_lag_{lag_horizon}"
         raw_feature_sales[feature_name] = raw_feature_sales.groupby(["id", "item_id", "store_id"])["sales"].shift(lag_horizon)
         feature_list.append(feature_name)
+
+    #----------------------------------
+    # 1.5 Explicit Intermittent Encodings
+    #----------------------------------
+    print("Calculating Explicit Intermittent Encodings...")
+    
+    # CRITICAL: We must use 'sales_lag_1' to avoid target leakage!
+    # We want to know how many zeros preceded *today*, without looking at today.
+    lag_1 = raw_feature_sales["sales_lag_1"].fillna(0)
+    
+    # Create a mask where yesterday was 0
+    is_zero_yesterday = (lag_1 == 0).astype(int)
+    
+    # Create a mask where yesterday had a sale (this acts as a reset trigger)
+    had_sale_yesterday = (lag_1 > 0).astype(int)
+    
+    # Create grouping blocks that increment every time a sale occurs for a specific item
+    sale_blocks = had_sale_yesterday.groupby(
+        [raw_feature_sales["id"], raw_feature_sales["item_id"], raw_feature_sales["store_id"]]
+    ).cumsum()
+    
+    # Cumulative sum of consecutive zeros within each reset block
+    raw_feature_sales["current_zero_streak"] = is_zero_yesterday.groupby(
+        [raw_feature_sales["id"], raw_feature_sales["item_id"], raw_feature_sales["store_id"], sale_blocks]
+    ).cumsum()
+    
+    # Because 'current_zero_streak' is essentially 'days_since_last_sale', we just need the one feature!
+    feature_list.append("current_zero_streak")
 
     #----------------------------------
     # 2. Rolling Windows
@@ -386,9 +414,12 @@ def prepare_stgnn_tensors() -> None:
     # Merge the volume data into the static_df
     static_df = static_df.merge(volumes, on="unique_id", how="left").fillna(0)
     
-    # 3. Call your custom function to build the volume-weighted graph!
-    # from .utils import build_weighted_adjacency
-    adj_tensor = build_weighted_adjacency(static_df=static_df, stat_exog_cols=stat_exog, volume_col="hist_volume")
+    # 3. Build the Data-Driven Correlation Graphs!
+    # We pass the full dataframe, the static node list, and the cutoff date to prevent leaks
+    adj_comp, adj_canni = build_correlation_adjacency(df, static_df, val_start_date)
+    
+    # Keep a legacy 'adj' for your ablations just in case
+    adj_legacy = adj_comp.clone()
 
     # ---------------------------------------------------------
     # NEW: Leak-Proof Department Aggregate Feature
@@ -465,19 +496,29 @@ def prepare_stgnn_tensors() -> None:
     
     # Find the exact integer indices of these features inside your temporal_features list
     futr_indices = [temporal_features.index(f) for f in futr_exog if f in temporal_features]
+
+    # Find the exact index where the training data ends
+    train_end_idx = y_tensor.shape[1] - (pred_len * 2)
+    
+    # Calculate zero-sales ratio ONLY on the training history [N]
+    zero_ratio = (y_tensor[:, :train_end_idx] == 0).float().mean(dim=1)
     
     # 5. Save the PyTorch Dictionary payload
     tensor_path = os.path.join(processed_dir, "stgnn_tensors.pt")
+    # Update the save payload to include both graphs (and keep 'adj' for legacy ablation compatibility)
     torch.save({
         "X": X_tensor,
         "y": y_tensor,
-        "adj": adj_tensor,
+        "adj": adj_legacy,       # Legacy safety
+        "adj_comp": adj_comp,  # Multi-graph A
+        "adj_canni": adj_canni,# Multi-graph B
         "n_nodes": n_nodes,
         "n_features": n_features,
-        "futr_indices": futr_indices
+        "futr_indices": futr_indices,
+        "zero_ratio": zero_ratio
     }, tensor_path)
     
-    print(f"Successfully built Tensors: X {X_tensor.shape}, adj {adj_tensor.shape}")
+    print(f"Successfully built Tensors: X {X_tensor.shape}, adj_comp {adj_comp.shape}, adj_canni {adj_canni.shape}")
     print(f"Saved payload to {tensor_path}")
 
 @asset(deps=["prepare_ml_data"])
@@ -563,7 +604,11 @@ def train_hybrid_stgnn() -> None:
     # 1. Load the payload
     processed_dir = os.path.join(os.getcwd(), "data", "processed")
     payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
-    X, y, adj = payload["X"], payload["y"], payload["adj"]
+    # Extract both
+    X, y = payload["X"], payload["y"]
+    adj_comp, adj_canni = payload["adj_comp"], payload["adj_canni"]
+    zero_ratio = payload["zero_ratio"]
+
     n_nodes, n_features = payload["n_nodes"], payload["n_features"]
     futr_indices = payload["futr_indices"]
     n_futr_features = len(futr_indices)
@@ -605,10 +650,11 @@ def train_hybrid_stgnn() -> None:
         n_nodes=n_nodes, 
         in_features=n_features, 
         hidden_features=hidden_features,
-        n_futr_features=n_futr_features
+        n_futr_features=n_futr_features,
+        zero_ratio=zero_ratio
     )
     
-    lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj, learning_rate=1e-3)
+    lit_model = LitSTGNNMixer(model=core_model, adj_comp=adj_comp, adj_canni=adj_canni, learning_rate=1e-3)
 
     # 6. Ignite PyTorch Lightning & Evaluate
     early_stop_callback = EarlyStopping(monitor="val_loss", patience=3, mode="min")
@@ -659,9 +705,12 @@ def train_residual_stgnn() -> None:
     df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
     payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
     
-    X, adj = payload["X"], payload["adj"]
+    # THE FIX: Extract both graphs
+    X = payload["X"]
+    adj_comp, adj_canni = payload["adj_comp"], payload["adj_canni"]
     n_nodes, n_features = payload["n_nodes"], payload["n_features"]
     futr_indices = payload["futr_indices"]
+    zero_ratio = payload["zero_ratio"]
     
     # --- THE PERFORMANCE HACKS ---
     seq_len = 14         # Slashed from 56 (Graph only needs recent error shocks)
@@ -754,10 +803,12 @@ def train_residual_stgnn() -> None:
         n_nodes=n_nodes, 
         in_features=1,  # <--- THE FIX: The model now expects ONLY 1 historical feature (the residual)!
         hidden_features=hidden_features, 
-        n_futr_features=len(futr_indices)
+        n_futr_features=len(futr_indices),
+        zero_ratio=zero_ratio
     )
     
-    lit_model = LitResidualSTGNN(model=core_model, adj_matrix=adj)
+    # THE FIX: Pass both graphs to the Lit module
+    lit_model = LitResidualSTGNN(model=core_model, adj_comp=adj_comp, adj_canni=adj_canni)
     
     # NOTE: PyTorch 2.0 Compilation (Uncomment if you transition to a Linux environment. It is finicky on Windows!)
     # lit_model = torch.compile(lit_model) 
@@ -987,56 +1038,56 @@ def train_statistical_baselines() -> None:
     predictions.to_parquet(os.path.join(out_dir, "stats_predictions.parquet"), index=False)
     print("Statistical baseline predictions saved.")
 
-@asset(deps=["prepare_ml_data"])
-def train_deep_baselines() -> None:
-    """Trains deep learning benchmarks (TSMixerx, TFT, NHITS) on the GPU."""
-    from neuralforecast import NeuralForecast
-    from neuralforecast.models import TSMixerx, TFT, NHITS
+# @asset(deps=["prepare_ml_data"])
+# def train_deep_baselines() -> None:
+#     """Trains deep learning benchmarks (TSMixerx, TFT, NHITS) on the GPU."""
+#     from neuralforecast import NeuralForecast
+#     from neuralforecast.models import TSMixerx, TFT, NHITS
     
-    processed_dir = os.path.join(os.getcwd(), "data", "processed")
-    df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
+#     processed_dir = os.path.join(os.getcwd(), "data", "processed")
+#     df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
     
-    n_series = df["unique_id"].nunique()
-    pred_len = 28
+#     n_series = df["unique_id"].nunique()
+#     pred_len = 28
     
-    all_dates = sorted(df["ds"].unique())
-    test_start_date = all_dates[-pred_len]
-    df_train_val = df[df["ds"] < test_start_date].copy()
-    df_test = df[df["ds"] >= test_start_date].copy()
+#     all_dates = sorted(df["ds"].unique())
+#     test_start_date = all_dates[-pred_len]
+#     df_train_val = df[df["ds"] < test_start_date].copy()
+#     df_test = df[df["ds"] >= test_start_date].copy()
     
-    stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
-    futr_exog = ["price", "promo_depth", "is_weekend", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
-    futr_exog = futr_exog + [col for col in df.columns if col.startswith("month_name_") or col.startswith("weekday_")]
+#     stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
+#     futr_exog = ["price", "promo_depth", "is_weekend", "snap_CA", "snap_TX", "snap_WI", "is_event", "days_until_next_event"]
+#     futr_exog = futr_exog + [col for col in df.columns if col.startswith("month_name_") or col.startswith("weekday_")]
 
-    # Drop the Deep Learning specific recent lags to prevent leakage
-    df_numeric = df.select_dtypes(include=[np.number])
-    lgb_cols = [col for col in df_numeric.columns if col.startswith("lgb_") or col in ["sales_lag_28", "sales_lag_35", "sales_lag_42", "sales_lag_56"]]
-    df_numeric = df_numeric.drop(columns=lgb_cols)
+#     # Drop the Deep Learning specific recent lags to prevent leakage
+#     df_numeric = df.select_dtypes(include=[np.number])
+#     lgb_cols = [col for col in df_numeric.columns if col.startswith("lgb_") or col in ["sales_lag_28", "sales_lag_35", "sales_lag_42", "sales_lag_56"]]
+#     df_numeric = df_numeric.drop(columns=lgb_cols)
 
-    hist_exog = [col for col in df_numeric.columns if 'lag' in col or 'mean' in col or 'std' in col or 'roll_sum' in col]
+#     hist_exog = [col for col in df_numeric.columns if 'lag' in col or 'mean' in col or 'std' in col or 'roll_sum' in col]
 
-    # Initialize all models (keeping max_steps low for quick execution on your local rig)
-    models = [
-        TSMixerx(h=pred_len, input_size=pred_len*2, n_series=n_series, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100),
-        TFT(h=pred_len, input_size=pred_len*2, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100),
-        NHITS(h=pred_len, input_size=pred_len*2, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100)
-    ]
+#     # Initialize all models (keeping max_steps low for quick execution on your local rig)
+#     models = [
+#         TSMixerx(h=pred_len, input_size=pred_len*2, n_series=n_series, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100),
+#         TFT(h=pred_len, input_size=pred_len*2, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100),
+#         NHITS(h=pred_len, input_size=pred_len*2, stat_exog_list=stat_exog, hist_exog_list=hist_exog, futr_exog_list=futr_exog, max_steps=100)
+#     ]
     
-    nf = NeuralForecast(models=models, freq='D')
-    static_df = df_train_val[["unique_id"] + stat_exog].drop_duplicates()
+#     nf = NeuralForecast(models=models, freq='D')
+#     static_df = df_train_val[["unique_id"] + stat_exog].drop_duplicates()
     
-    print("Igniting Deep Learning Baselines (TSMixerx, TFT, NHITS)...")
-    nf.fit(df=df_train_val, static_df=static_df, val_size=pred_len)
+#     print("Igniting Deep Learning Baselines (TSMixerx, TFT, NHITS)...")
+#     nf.fit(df=df_train_val, static_df=static_df, val_size=pred_len)
     
-    # Generate test predictions
-    futr_df = df_test[['unique_id', 'ds'] + futr_exog]
-    predictions = nf.predict(df=df_train_val, static_df=static_df, futr_df=futr_df)
-    predictions = predictions.reset_index()
+#     # Generate test predictions
+#     futr_df = df_test[['unique_id', 'ds'] + futr_exog]
+#     predictions = nf.predict(df=df_train_val, static_df=static_df, futr_df=futr_df)
+#     predictions = predictions.reset_index()
     
-    out_dir = os.path.join(os.getcwd(), "data", "predictions")
-    os.makedirs(out_dir, exist_ok=True)
-    predictions.to_parquet(os.path.join(out_dir, "deep_predictions.parquet"), index=False)
-    print("Deep learning predictions saved.")
+#     out_dir = os.path.join(os.getcwd(), "data", "predictions")
+#     os.makedirs(out_dir, exist_ok=True)
+#     predictions.to_parquet(os.path.join(out_dir, "deep_predictions.parquet"), index=False)
+#     print("Deep learning predictions saved.")
 
 @asset(deps=[
     "train_statistical_baselines", 
@@ -1082,10 +1133,12 @@ def evaluate_benchmark() -> None:
     # 3. Generate STGNN Predictions (Full + Ablations)
     # ---------------------------------------------------------
     payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
-    X, y, adj = payload["X"], payload["y"], payload["adj"]
+    X, y = payload["X"], payload["y"]
+    adj_comp, adj_canni = payload["adj_comp"], payload["adj_canni"]
     n_nodes, n_features = payload["n_nodes"], payload["n_features"]
     seq_len = 56
     futr_indices = payload["futr_indices"]
+    zero_ratio = payload["zero_ratio"]
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     test_start_idx = X.shape[1] - pred_len
@@ -1117,10 +1170,11 @@ def evaluate_benchmark() -> None:
         core_model = STGNNMixer(
             seq_len=seq_len, pred_len=pred_len, n_nodes=n_nodes, 
             in_features=n_features, hidden_features=hidden_features, 
-            n_futr_features=len(futr_indices), ablation_mode=ablation_mode
+            n_futr_features=len(futr_indices), ablation_mode=ablation_mode,
+            zero_ratio=zero_ratio
         )
         
-        lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj.to(device))
+        lit_model = LitSTGNNMixer(model=core_model, adj_comp=adj_comp.to(device), adj_canni=adj_canni.to(device))
         lit_model.load_state_dict(state_dict)
         lit_model.to(device)
         lit_model.eval()
@@ -1224,10 +1278,11 @@ def evaluate_benchmark() -> None:
             n_nodes=n_nodes, 
             in_features=1, # The Pure Approach: Only 1 historical feature!
             hidden_features=res_hidden_features, 
-            n_futr_features=len(futr_indices)
+            n_futr_features=len(futr_indices),
+            zero_ratio=zero_ratio,
         )
         
-        lit_res_model = LitResidualSTGNN(model=core_res_model, adj_matrix=adj.to(device))
+        lit_res_model = LitResidualSTGNN(model=core_res_model, adj_comp=adj_comp.to(device), adj_canni=adj_canni.to(device))
         lit_res_model.load_state_dict(state_dict)
         lit_res_model.to(device)
         lit_res_model.eval()
@@ -1390,155 +1445,155 @@ def evaluate_benchmark() -> None:
 #     nf.save(path=model_dir, model_index=None, overwrite=True, save_dataset=False)
 
 
-@asset(deps=["train_hybrid_stgnn"])
-def explain_forecast_captum() -> None:
-    import torch
-    import os
-    import numpy as np
-    import pandas as pd
-    from pathlib import Path
-    from captum.attr import IntegratedGradients
-    from .hybrid_model import STGNNMixer, LitSTGNNMixer
+# @asset(deps=["train_hybrid_stgnn"])
+# def explain_forecast_captum() -> None:
+#     import torch
+#     import os
+#     import numpy as np
+#     import pandas as pd
+#     from pathlib import Path
+#     from captum.attr import IntegratedGradients
+#     from .hybrid_model import STGNNMixer, LitSTGNNMixer
 
-    # 1. Setup paths
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
-    DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-    processed_dir = os.path.join(DATA_DIR, "processed")
-    model_dir = os.path.join(DATA_DIR, "models", "stgnnmixer")
+#     # 1. Setup paths
+#     PROJECT_ROOT = Path(__file__).resolve().parent.parent
+#     DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+#     processed_dir = os.path.join(DATA_DIR, "processed")
+#     model_dir = os.path.join(DATA_DIR, "models", "stgnnmixer")
 
-    # 2A. Extract Exact Feature Names & Product Metadata
-    df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
-    stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
-    ignore_cols = ["unique_id", "ds", "y"] + stat_exog
-    df_numeric = df.select_dtypes(include=[np.number])
-    feature_names = [col for col in df_numeric.columns if col not in ignore_cols]
+#     # 2A. Extract Exact Feature Names & Product Metadata
+#     df = pd.read_parquet(os.path.join(processed_dir, "ml_ready_data.parquet"))
+#     stat_exog = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
+#     ignore_cols = ["unique_id", "ds", "y"] + stat_exog
+#     df_numeric = df.select_dtypes(include=[np.number])
+#     feature_names = [col for col in df_numeric.columns if col not in ignore_cols]
 
-    # Create a lookup table for the nodes
-    # Load the un-encoded data to get the real string names
-    raw_df = pd.read_parquet(os.path.join(processed_dir, "model_input.parquet"))
+#     # Create a lookup table for the nodes
+#     # Load the un-encoded data to get the real string names
+#     raw_df = pd.read_parquet(os.path.join(processed_dir, "model_input.parquet"))
     
-    # Filter to only the items that made it into our final dataset, 
-    # and sort them by unique_id so they perfectly match the PyTorch tensor indices.
-    valid_ids = df["unique_id"].unique()
-    static_df = raw_df[raw_df["unique_id"].isin(valid_ids)][
-        ["unique_id", "item_id", "dept_id", "store_id"]
-    ].drop_duplicates().sort_values("unique_id").reset_index(drop=True)
+#     # Filter to only the items that made it into our final dataset, 
+#     # and sort them by unique_id so they perfectly match the PyTorch tensor indices.
+#     valid_ids = df["unique_id"].unique()
+#     static_df = raw_df[raw_df["unique_id"].isin(valid_ids)][
+#         ["unique_id", "item_id", "dept_id", "store_id"]
+#     ].drop_duplicates().sort_values("unique_id").reset_index(drop=True)
 
-    # 2B. Load Tensors & Hyperparameters
-    payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
-    X, y, adj = payload["X"], payload["y"], payload["adj"]
-    n_nodes, n_features = payload["n_nodes"], payload["n_features"]
+#     # 2B. Load Tensors & Hyperparameters
+#     payload = torch.load(os.path.join(processed_dir, "stgnn_tensors.pt"))
+#     X, y, adj = payload["X"], payload["y"], payload["adj"]
+#     n_nodes, n_features = payload["n_nodes"], payload["n_features"]
     
-    seq_len = 56
-    pred_len = 28
-    futr_indices = payload["futr_indices"]
-    n_futr_features = len(futr_indices)
+#     seq_len = 56
+#     pred_len = 28
+#     futr_indices = payload["futr_indices"]
+#     n_futr_features = len(futr_indices)
     
-    weights_path = os.path.join(model_dir, "weights.pt")
-    state_dict = torch.load(weights_path)
-    hidden_features = state_dict['model.static_node_emb'].shape[1]
+#     weights_path = os.path.join(model_dir, "weights.pt")
+#     state_dict = torch.load(weights_path)
+#     hidden_features = state_dict['model.static_node_emb'].shape[1]
 
-    # 3. GPU Acceleration Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     # 3. GPU Acceleration Setup
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    x_hist = X[:, -seq_len-pred_len : -pred_len, :].unsqueeze(0).to(device)
-    x_future = X[:, -pred_len:, futr_indices].unsqueeze(0).to(device)
+#     x_hist = X[:, -seq_len-pred_len : -pred_len, :].unsqueeze(0).to(device)
+#     x_future = X[:, -pred_len:, futr_indices].unsqueeze(0).to(device)
 
-    core_model = STGNNMixer(seq_len, pred_len, n_nodes, n_features, hidden_features, n_futr_features)
-    lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj.to(device))
-    lit_model.load_state_dict(state_dict)
-    lit_model.to(device)
-    lit_model.eval()
+#     core_model = STGNNMixer(seq_len, pred_len, n_nodes, n_features, hidden_features, n_futr_features)
+#     lit_model = LitSTGNNMixer(model=core_model, adj_matrix=adj.to(device))
+#     lit_model.load_state_dict(state_dict)
+#     lit_model.to(device)
+#     lit_model.eval()
 
-    # Define Target Node
-    TARGET_NODE_IDX = 0
-    target_metadata = static_df.iloc[TARGET_NODE_IDX]
+#     # Define Target Node
+#     TARGET_NODE_IDX = 0
+#     target_metadata = static_df.iloc[TARGET_NODE_IDX]
 
-    class NodeForecastWrapper(torch.nn.Module):
-        def __init__(self, model, target_node, target_day):
-            super().__init__()
-            self.model = model
-            self.target_node = target_node
-            self.target_day = target_day
+#     class NodeForecastWrapper(torch.nn.Module):
+#         def __init__(self, model, target_node, target_day):
+#             super().__init__()
+#             self.model = model
+#             self.target_node = target_node
+#             self.target_day = target_day
 
-        def forward(self, hist, futr):
-            out = self.model(hist, futr)
-            return out[:, self.target_node, self.target_day]
+#         def forward(self, hist, futr):
+#             out = self.model(hist, futr)
+#             return out[:, self.target_node, self.target_day]
 
-    wrapper_model = NodeForecastWrapper(lit_model, target_node=TARGET_NODE_IDX, target_day=0)
+#     wrapper_model = NodeForecastWrapper(lit_model, target_node=TARGET_NODE_IDX, target_day=0)
 
-    baseline_hist = torch.zeros_like(x_hist).to(device)
-    baseline_futr = torch.zeros_like(x_future).to(device)
+#     baseline_hist = torch.zeros_like(x_hist).to(device)
+#     baseline_futr = torch.zeros_like(x_future).to(device)
 
-    # 4. Ignite Integrated Gradients
-    print(f"Calculating Integrated Gradients for {target_metadata['item_id']} at {target_metadata['store_id']}...")
-    ig = IntegratedGradients(wrapper_model)
+#     # 4. Ignite Integrated Gradients
+#     print(f"Calculating Integrated Gradients for {target_metadata['item_id']} at {target_metadata['store_id']}...")
+#     ig = IntegratedGradients(wrapper_model)
     
-    attributions = ig.attribute(
-        inputs=(x_hist, x_future),
-        baselines=(baseline_hist, baseline_futr),
-        n_steps=50, 
-        internal_batch_size=1
-    )
+#     attributions = ig.attribute(
+#         inputs=(x_hist, x_future),
+#         baselines=(baseline_hist, baseline_futr),
+#         n_steps=50, 
+#         internal_batch_size=1
+#     )
     
-    attr_hist, attr_futr = attributions
+#     attr_hist, attr_futr = attributions
 
-    # Move results back to CPU
-    attr_hist_cpu = attr_hist.detach().cpu().numpy()
-    attr_futr_cpu = attr_futr.detach().cpu().numpy()
+#     # Move results back to CPU
+#     attr_hist_cpu = attr_hist.detach().cpu().numpy()
+#     attr_futr_cpu = attr_futr.detach().cpu().numpy()
     
-    # ---------------------------------------------------------
-    # NEW: 5. Spatial (Cross-Item) Influence Calculation
-    # ---------------------------------------------------------
-    # 1. Magnitude: Who has the biggest overall impact? (Absolute sum)
-    magnitude_influence = np.abs(attr_hist_cpu[0]).sum(axis=(1, 2))
-    magnitude_influence[TARGET_NODE_IDX] = 0.0 
+#     # ---------------------------------------------------------
+#     # NEW: 5. Spatial (Cross-Item) Influence Calculation
+#     # ---------------------------------------------------------
+#     # 1. Magnitude: Who has the biggest overall impact? (Absolute sum)
+#     magnitude_influence = np.abs(attr_hist_cpu[0]).sum(axis=(1, 2))
+#     magnitude_influence[TARGET_NODE_IDX] = 0.0 
     
-    # 2. Direction: Is it a Halo (+) or Cannibalization (-)? (Raw sum)
-    directional_influence = attr_hist_cpu[0].sum(axis=(1, 2))
+#     # 2. Direction: Is it a Halo (+) or Cannibalization (-)? (Raw sum)
+#     directional_influence = attr_hist_cpu[0].sum(axis=(1, 2))
     
-    # Get top 3 most influential external nodes by MAGNITUDE
-    top_spatial_indices = np.argsort(magnitude_influence)[-3:][::-1]
+#     # Get top 3 most influential external nodes by MAGNITUDE
+#     top_spatial_indices = np.argsort(magnitude_influence)[-3:][::-1]
 
-    # Node 0's own feature importance (Using axis=0 for NumPy!)
-    total_hist_importance = attr_hist_cpu[0, TARGET_NODE_IDX].sum(axis=0)
-    total_futr_importance = attr_futr_cpu[0, TARGET_NODE_IDX].sum(axis=0)
+#     # Node 0's own feature importance (Using axis=0 for NumPy!)
+#     total_hist_importance = attr_hist_cpu[0, TARGET_NODE_IDX].sum(axis=0)
+#     total_futr_importance = attr_futr_cpu[0, TARGET_NODE_IDX].sum(axis=0)
     
-    print("\n" + "━"*70)
-    print("🧠 EXPLAINABLE AI: MULTI-RELATIONAL ATTRIBUTION 🧠")
-    print("━"*70)
-    print(f"TARGET ITEM: {target_metadata['item_id']} | Dept: {target_metadata['dept_id']} | Store: {target_metadata['store_id']}")
-    print("━"*70)
+#     print("\n" + "━"*70)
+#     print("🧠 EXPLAINABLE AI: MULTI-RELATIONAL ATTRIBUTION 🧠")
+#     print("━"*70)
+#     print(f"TARGET ITEM: {target_metadata['item_id']} | Dept: {target_metadata['dept_id']} | Store: {target_metadata['store_id']}")
+#     print("━"*70)
     
-    print("\n[1] OWN FEATURE IMPORTANCE (What intrinsic data drove this forecast?)")
-    print("--- Future Covariates ---")
-    for i, futr_idx in enumerate(futr_indices):
-        name = feature_names[futr_idx]
-        print(f"{name.ljust(25)}: {total_futr_importance[i]:+.4f}")
+#     print("\n[1] OWN FEATURE IMPORTANCE (What intrinsic data drove this forecast?)")
+#     print("--- Future Covariates ---")
+#     for i, futr_idx in enumerate(futr_indices):
+#         name = feature_names[futr_idx]
+#         print(f"{name.ljust(25)}: {total_futr_importance[i]:+.4f}")
         
-    print("\n--- Historical Features (Top 3) ---")
-    top_hist_indices = np.argsort(np.abs(total_hist_importance))[-3:][::-1]
-    for idx in top_hist_indices:
-        name = feature_names[idx]
-        print(f"{name.ljust(25)}: {total_hist_importance[idx]:+.4f}")
+#     print("\n--- Historical Features (Top 3) ---")
+#     top_hist_indices = np.argsort(np.abs(total_hist_importance))[-3:][::-1]
+#     for idx in top_hist_indices:
+#         name = feature_names[idx]
+#         print(f"{name.ljust(25)}: {total_hist_importance[idx]:+.4f}")
 
-    print("\n[2] SPATIAL INFLUENCE (Which OTHER products drove this forecast?)")
-    for rank, idx in enumerate(top_spatial_indices):
-        inf_node = static_df.iloc[idx]
-        mag_score = magnitude_influence[idx]
-        dir_score = directional_influence[idx]
+#     print("\n[2] SPATIAL INFLUENCE (Which OTHER products drove this forecast?)")
+#     for rank, idx in enumerate(top_spatial_indices):
+#         inf_node = static_df.iloc[idx]
+#         mag_score = magnitude_influence[idx]
+#         dir_score = directional_influence[idx]
         
-        # Determine the economic relationship!
-        relationship = "HALO EFFECT (+)" if dir_score > 0 else "CANNIBALIZATION (-)"
+#         # Determine the economic relationship!
+#         relationship = "HALO EFFECT (+)" if dir_score > 0 else "CANNIBALIZATION (-)"
         
-        print(f"#{rank+1} Influence (Magnitude {mag_score:.4f}):")
-        print(f"    Item:  {inf_node['item_id']} | Type: {relationship} ({dir_score:+.4f})")
-        print(f"    Store: {inf_node['store_id']} | Dept: {inf_node['dept_id']}")
+#         print(f"#{rank+1} Influence (Magnitude {mag_score:.4f}):")
+#         print(f"    Item:  {inf_node['item_id']} | Type: {relationship} ({dir_score:+.4f})")
+#         print(f"    Store: {inf_node['store_id']} | Dept: {inf_node['dept_id']}")
         
-        if inf_node['dept_id'] != target_metadata['dept_id']:
-            print("    *CROSS-DEPARTMENT DISCOVERY*")
+#         if inf_node['dept_id'] != target_metadata['dept_id']:
+#             print("    *CROSS-DEPARTMENT DISCOVERY*")
         
-    print("━"*70 + "\n")
+#     print("━"*70 + "\n")
 
 
 # @asset(deps=["train_hybrid_stgnn"])

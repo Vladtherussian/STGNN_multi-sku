@@ -4,58 +4,64 @@ import numpy as np
 import pandas as pd
 import torch
 
-
-def build_weighted_adjacency(static_df: pd.DataFrame, stat_exog_cols: list, volume_col: str = None) -> torch.Tensor:
+def build_correlation_adjacency(df: pd.DataFrame, static_df: pd.DataFrame, val_start_date: str) -> tuple:
     """
-    Builds a normalized, weighted adjacency matrix based on shared static attributes,
-    using hierarchical weighting and a strict department mask for sparsity.
-    Optionally weights the edges by the target node's historical volume.
+    Builds Data-Driven Complement and Cannibalization graphs using Pearson Correlation 
+    of historical training sales. Eliminates human categorical bias.
     """
-    n_nodes = len(static_df)
-    adj_matrix = np.zeros((n_nodes, n_nodes))
+    print("Calculating Data-Driven Pearson Correlation Matrices...")
     
-    weights = {
-        "item_id": 1.0,  
-        "dept_id": 0.5,  
-        "cat_id": 0.1,   
-    }
+    # 1. Isolate Training Data (Strictly prevent future data leakage!)
+    train_df = df[df['ds'] < val_start_date].copy()
     
-    for col in stat_exog_cols:
-        if col in weights:
-            vals = static_df[col].values
-            match_matrix = (vals[:, None] == vals[None, :]).astype(float)
-            adj_matrix += match_matrix * weights[col]
-            
-    # Hard Sparsity Mask
-    dept_vals = static_df['dept_id'].values
-    dept_mask = (dept_vals[:, None] == dept_vals[None, :]).astype(float)
-    adj_matrix = adj_matrix * dept_mask 
-
-    # --- NEW: GEOGRAPHIC FIREWALL (Store Mask) ---
-    # Strictly zero-out any connections between different physical locations
-    store_vals = static_df['store_id'].values
-    store_mask = (store_vals[:, None] == store_vals[None, :]).astype(float)
-    adj_matrix = adj_matrix * store_mask
+    # 2. Pivot to get [Time x Nodes] matrix
+    # Fill missing days with 0 to ensure accurate variance calculation
+    pivot_df = train_df.pivot(index='ds', columns='unique_id', values='y').fillna(0)
     
-    # --- NEW: VOLUME WEIGHTING ---
-    # If volume data is provided, scale the incoming edges by the node's volume
-    if volume_col and volume_col in static_df.columns:
-        volumes = static_df[volume_col].values
-        # Add a tiny constant (1e-5) so items with 0 average sales don't completely zero out their graph
-        volumes = np.clip(volumes, a_min=1e-5, a_max=None)
+    # Ensure the columns exactly match the sorted order of your PyTorch Tensors
+    node_order = static_df['unique_id'].tolist()
+    pivot_df = pivot_df[node_order]
+    
+    # 3. Calculate Pearson Correlation Matrix [Nodes x Nodes]
+    corr_matrix = pivot_df.corr(method='pearson').values
+    
+    # Fill NaNs (Items with completely flat 0 sales have zero variance, resulting in NaN correlation)
+    corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
+    
+    # 4. Split into True Complements and True Substitutes
+    # We use thresholds to act as a noise filter. We only want strong economic signals.
+    pos_threshold = 0.05  # Positive correlation = Halo Effect
+    neg_threshold = -0.05 # Negative correlation = Cannibalization
+    
+    adj_comp = np.where(corr_matrix > pos_threshold, corr_matrix, 0.0)
+    
+    # For cannibalization, we take the ABSOLUTE value. The GNN spatial routing requires 
+    # positive edge weights to pass the signal. The network's alpha scalars will handle the rest.
+    adj_canni = np.where(corr_matrix < neg_threshold, np.abs(corr_matrix), 0.0) 
+    
+    # 5. The Geographic Firewall (Store Mask)
+    # Even if sales correlate, items in TX_1 cannot physically interact with items in TX_2
+    # store_vals = static_df['store_id'].values
+    # store_mask = (store_vals[:, None] == store_vals[None, :]).astype(float)
+    
+    # adj_comp = adj_comp * store_mask
+    # adj_canni = adj_canni * store_mask
+    
+    # Remove self-loops from cannibalization (an item cannot substitute itself)
+    np.fill_diagonal(adj_canni, 0.0)
+    
+    # 6. Row-Normalize to prevent exploding gradients during message passing
+    def normalize_graph(matrix):
+        row_sums = matrix.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0 
+        return matrix / row_sums
         
-        # Multiply each column by the target node's volume
-        # This makes connections TO high-volume nodes stronger
-        # adj_matrix = adj_matrix * volumes[None, :]
-        volumes_norm = volumes / (volumes.max() + 1e-9)
-        adj_matrix = adj_matrix * volumes_norm[None, :]
-
-    # Row-normalize so graph convolutions don't explode
-    row_sums = adj_matrix.sum(axis=1, keepdims=True)
-    row_sums[row_sums == 0] = 1.0 
-    adj_matrix = adj_matrix / row_sums
+    adj_comp = normalize_graph(adj_comp)
+    adj_canni = normalize_graph(adj_canni)
     
-    return torch.tensor(adj_matrix, dtype=torch.float32)
+    print(f"Graph Density - Complements: {(adj_comp > 0).mean():.4%} | Cannibalization: {(adj_canni > 0).mean():.4%}")
+    
+    return torch.tensor(adj_comp, dtype=torch.float32), torch.tensor(adj_canni, dtype=torch.float32)
 
 
 

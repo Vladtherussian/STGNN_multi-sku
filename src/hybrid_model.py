@@ -36,7 +36,7 @@ class GraphMixerBlock(nn.Module):
         self.spatial_lin  = nn.Linear(n_features, n_features, bias=False)
         self.spatial_bias = nn.Parameter(torch.zeros(n_features))
 
-    def forward(self, x, adj):
+    def forward(self, x, adj_comp, adj_canni):
         B, N, S, Feat = x.shape
 
         # 1. Convolution Mixing (Pre-Norm)
@@ -58,13 +58,18 @@ class GraphMixerBlock(nn.Module):
         x_feat = self.feature_mlp(x_norm)
         x = x + x_feat
         
-        # 4. Spatial Mixing (Pre-Norm)
+        # 4. MULTI-GRAPH Spatial Mixing (Pre-Norm)
         x_norm = self.norm_spat(x)
         x_proj = self.spatial_lin(x_norm)
         
         x_proj_2d = x_proj.reshape(B, N, S * Feat)
-        x_spatial_2d = torch.bmm(adj, x_proj_2d)
-        x_spatial = x_spatial_2d.reshape(B, N, S, Feat) + self.spatial_bias
+        
+        # Calculate parallel signals for Complements and Cannibalization
+        x_spat_comp = torch.bmm(adj_comp, x_proj_2d)
+        x_spat_canni = torch.bmm(adj_canni, x_proj_2d)
+        
+        # Sum the orthogonal spatial signals together
+        x_spatial = (x_spat_comp + x_spat_canni).reshape(B, N, S, Feat) + self.spatial_bias
             
         x = x + x_spatial
         
@@ -87,7 +92,7 @@ class STGNNMixer(nn.Module):
       x_proj_2d     [B, N, S*Feat]    : ~105 MB  (peak inside block)
     Total estimated peak: ~2–3 GB, leaving headroom for optimizer states.
     """
-    def __init__(self, seq_len, pred_len, n_nodes, in_features, hidden_features, n_futr_features, n_blocks=2, top_k=5, ablation_mode="full"):
+    def __init__(self, seq_len, pred_len, n_nodes, in_features, hidden_features, n_futr_features, zero_ratio, n_blocks=2, top_k=5, ablation_mode="full"):
         super().__init__()
         self.seq_len = seq_len
         self.pred_len = pred_len
@@ -98,11 +103,25 @@ class STGNNMixer(nn.Module):
         # Trainable identities
         # self.node_emb = nn.Parameter(torch.randn(n_nodes, hidden_features))
         if self.ablation_mode == "full":
-            self.graph_alpha = nn.Parameter(torch.tensor(2.20)) # Start with a bias towards the static graph (sigmoid(2.2) ~ 0.9)
+            # Register the static Sparsity Prior [N]
+            self.register_buffer('zero_ratio', zero_ratio) 
+
+            # The Sparsity Gates: Maps historical sparsity to graph trust
+            self.sparsity_gate_comp = nn.Sequential(
+                nn.Linear(1, 8),
+                nn.ReLU(),
+                nn.Linear(8, 1),
+                nn.Sigmoid() 
+            )
+            self.sparsity_gate_canni = nn.Sequential(
+                nn.Linear(1, 8),
+                nn.ReLU(),
+                nn.Linear(8, 1),
+                nn.Sigmoid() 
+            )
         else:
-            # For ablations, we freeze alpha so it cannot learn.
-            # 1.0 means it relies 100% on the static Walmart hierarchy.
-            self.register_buffer("graph_alpha", torch.tensor(1.0))
+            self.register_buffer("alpha_comp", torch.tensor(1.0))
+            self.register_buffer("alpha_canni", torch.tensor(1.0))
         
         
         self.feature_projection = nn.Linear(in_features, hidden_features)
@@ -118,9 +137,14 @@ class STGNNMixer(nn.Module):
         # A Bernoulli gate to predict "is this item selling at all during this horizon" [cite: 131]
         # self.zero_gate = nn.Linear((seq_len * hidden_features) + (pred_len * hidden_features), pred_len)
         
-        # Instead of static node_emb, we will generate the graph dynamically
-        self.query_proj = nn.Linear(hidden_features, hidden_features)
-        self.key_proj = nn.Linear(hidden_features, hidden_features)
+        # THE FIX: Dual Dynamic Attention Heads
+        # Head 1: Learns to dynamically route Halo effects
+        self.query_comp = nn.Linear(hidden_features, hidden_features)
+        self.key_comp = nn.Linear(hidden_features, hidden_features)
+        
+        # Head 2: Learns to dynamically route Substitution effects
+        self.query_canni = nn.Linear(hidden_features, hidden_features)
+        self.key_canni = nn.Linear(hidden_features, hidden_features)
         
         # We can keep the static node embedding as a baseline "identity" for each node
         self.static_node_emb = nn.Parameter(torch.randn(n_nodes, hidden_features) * 0.02) # Small init to prevent early training instability
@@ -141,7 +165,7 @@ class STGNNMixer(nn.Module):
         self.head = nn.Sequential(nn.Linear((seq_len * hidden_features) + (pred_len * hidden_features), pred_len))
         
 
-    def forward(self, x, x_future, adj):
+    def forward(self, x, x_future, adj_comp, adj_canni):
         B, N, S, Feat = x.shape
         
         # 1. Local Normalization
@@ -172,60 +196,52 @@ class STGNNMixer(nn.Module):
             # We use the exponential recency weights so recent shocks drive the graph 
             x_context = (x * self.recency_weights.view(1, 1, -1, 1)).sum(dim=2)
             
-            # B. Generate Queries and Keys
-            Q = self.query_proj(x_context) # [B, N, Hidden]
-            K = self.key_proj(x_context)   # [B, N, Hidden]
+            # B. Generate Dual Queries and Keys
+            Q_c, K_c = self.query_comp(x_context), self.key_comp(x_context)
+            Q_k, K_k = self.query_canni(x_context), self.key_canni(x_context)
             
-            # C. Compute dynamic connection strength: Q * K^T
-            # Shape: [B, N, N]
-            dynamic_adj = torch.bmm(Q, K.transpose(1, 2))
+            # C. Compute Dual Dynamic Adjacencies
+            dyn_comp = torch.bmm(Q_c, K_c.transpose(1, 2)) / (Q_c.shape[-1] ** 0.5)
+            dyn_canni = torch.bmm(Q_k, K_k.transpose(1, 2)) / (Q_k.shape[-1] ** 0.5)
             
-            # D. Scale to prevent exploding gradients (standard attention mechanism)
-            dynamic_adj = dynamic_adj / (Q.shape[-1] ** 0.5)
+            # D. Clamp & ReLU
+            dyn_comp = F.relu(dyn_comp.clamp(min=-10.0, max=10.0))
+            dyn_canni = F.relu(dyn_canni.clamp(min=-10.0, max=10.0))
             
-            # Guard 1: clamp scores before ReLU.
-            # Under fp16 mixed precision, large Q/K dot products can overflow to +inf.
-            # +inf survives ReLU and then causes softmax([+inf, -inf, ...]) = NaN.
-            # Clamping to [-10, 10] is safe — softmax is saturated well before these values.
-            dynamic_adj = dynamic_adj.clamp(min=-10.0, max=10.0)
-            dynamic_adj = F.relu(dynamic_adj)
-            
-            # E. Top-K Sparsification (Applied per batch!)
-            # Guard 2: top_k must not exceed N. If the downsampling config changes and
-            # produces fewer nodes than top_k, torch.topk raises a hard runtime error.
+            # E. Dual Top-K Sparsification
             safe_k = min(self.top_k, N)
-            topk_values, topk_indices = torch.topk(dynamic_adj, k=safe_k, dim=2)
-            mask = torch.zeros_like(dynamic_adj).scatter_(2, topk_indices, 1.0)
             
-            # Replace non-top-K positions with -infinity before the softmax.
-            dynamic_adj = dynamic_adj.masked_fill(mask == 0, float('-inf'))
-            dynamic_adj = F.softmax(dynamic_adj, dim=2)
+            # Sparsify Complement Graph
+            comp_vals, comp_idx = torch.topk(dyn_comp, k=safe_k, dim=2)
+            mask_comp = torch.zeros_like(dyn_comp).scatter_(2, comp_idx, 1.0)
+            dyn_comp = F.softmax(dyn_comp.masked_fill(mask_comp == 0, float('-inf')), dim=2)
+            dyn_comp = torch.nan_to_num(dyn_comp, nan=0.0)
             
-            # Guard 3: nan_to_num as a final safety net.
-            # If an entire row was zero after ReLU AND all top-K positions are zero,
-            # softmax still produces a valid uniform distribution (not NaN). But if any
-            # upstream NaN slips through (e.g. from gradient tape in rare fp16 edge cases),
-            # this replaces it with 0 so the row gets no graph signal rather than poisoning
-            # all downstream gradients with NaN.
-            dynamic_adj = torch.nan_to_num(dynamic_adj, nan=0.0)
+            # Sparsify Cannibalization Graph
+            canni_vals, canni_idx = torch.topk(dyn_canni, k=safe_k, dim=2)
+            mask_canni = torch.zeros_like(dyn_canni).scatter_(2, canni_idx, 1.0)
+            dyn_canni = F.softmax(dyn_canni.masked_fill(mask_canni == 0, float('-inf')), dim=2)
+            dyn_canni = torch.nan_to_num(dyn_canni, nan=0.0)
 
-            # Constrain alpha strictly between 0.0 and 1.0
-            alpha = torch.sigmoid(self.graph_alpha)
-            
-            # F. Blend with static business rules
-            static_adj_batch = adj.unsqueeze(0).repeat(B, 1, 1)
-            combined_adj = (alpha * static_adj_batch) + ((1 - alpha) * dynamic_adj)
-            combined_adj = F.normalize(combined_adj, p=1, dim=2)
+            # F. Dual Blend with static business rules
+            static_comp_batch = adj_comp.unsqueeze(0).repeat(B, 1, 1)
+            static_canni_batch = adj_canni.unsqueeze(0).repeat(B, 1, 1)
 
-        # 4. Message Passing with gradient checkpointing.
-        # Each GraphMixerBlock stores [B, N, S, Feat] activations for backprop.
-        # At B=8, N=1437, S=56, Feat=64 that is ~210 MB per block in fp32.
-        # Checkpointing discards those activations and recomputes them during
-        # the backward pass, saving ~(n_blocks - 1) * block_activation_memory
-        # at the cost of one extra forward pass per block.
+            # Node-level alpha conditioned on sparsity [1, N, 1]
+            alpha_c = self.sparsity_gate_comp(self.zero_ratio.unsqueeze(-1)).unsqueeze(0)
+            alpha_k = self.sparsity_gate_canni(self.zero_ratio.unsqueeze(-1)).unsqueeze(0)
+            
+            # Blend the specialized dynamic maps into their respective static graphs
+            combined_comp = (alpha_c * static_comp_batch) + ((1 - alpha_c) * dyn_comp)
+            combined_canni = (alpha_k * static_canni_batch) + ((1 - alpha_k) * dyn_canni)
+            
+            combined_comp = F.normalize(combined_comp, p=1, dim=2)
+            combined_canni = F.normalize(combined_canni, p=1, dim=2)
+
+        # 4. Message Passing with Multi-Graph Tensors
         from torch.utils.checkpoint import checkpoint
         for block in self.blocks:
-            x = checkpoint(block, x, combined_adj, use_reentrant=False)
+            x = checkpoint(block, x, combined_comp, combined_canni, use_reentrant=False)
             
         x_hist_flat = x.reshape(B, N, S * x.shape[-1])
         
@@ -267,14 +283,15 @@ class GraphTimeSeriesDataset(Dataset):
 
 class LitSTGNNMixer(pl.LightningModule):
     """The PyTorch Lightning wrapper that handles the training loop and GPU acceleration."""
-    def __init__(self, model, adj_matrix, learning_rate=1e-3):
+    def __init__(self, model, adj_comp, adj_canni, learning_rate=1e-3):
         super().__init__()
         self.model = model
         self.learning_rate = learning_rate
-        self.register_buffer("adj_matrix", adj_matrix)
+        self.register_buffer("adj_comp", adj_comp)
+        self.register_buffer("adj_canni", adj_canni)
 
     def forward(self, x, x_future):
-        return self.model(x, x_future, self.adj_matrix)
+        return self.model(x, x_future, self.adj_comp, self.adj_canni)
 
     def training_step(self, batch, _batch_idx):
         x, y_hist, x_future, y = batch
@@ -311,8 +328,10 @@ class LitSTGNNMixer(pl.LightningModule):
         residuals = log_y - log_y_hat          
         res_mean = residuals.mean(dim=-1)          
         
+        # THE FIX: Apply consistency regularization specifically to the Complement Graph, 
+        # as items in the same department should exhibit correlated errors.
         neighbor_res = torch.bmm(
-            self.adj_matrix.float().unsqueeze(0).expand(residuals.shape[0], -1, -1),
+            self.adj_comp.float().unsqueeze(0).expand(residuals.shape[0], -1, -1),
             res_mean.unsqueeze(-1)
         ).squeeze(-1)
         
@@ -375,19 +394,24 @@ class LitSTGNNMixer(pl.LightningModule):
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
     
     def on_train_epoch_end(self):
-        if hasattr(self.model, 'graph_alpha'):
-            alpha_val = torch.sigmoid(self.model.graph_alpha).item()
-            print(f"\n--- Epoch {self.current_epoch} End ---")
-            print(f"Graph Alpha (Business vs. Latent): {alpha_val:.4f}")
-            self.log("graph_alpha", alpha_val, prog_bar=True)
-
-        if hasattr(self.model, 'static_node_emb'):
+        # Safely check if we are using the MLP gates
+        if hasattr(self.model, 'sparsity_gate_comp'):
             with torch.no_grad():
-                learned_adj = torch.matmul(self.model.static_node_emb, self.model.static_node_emb.transpose(0, 1))
-                learned_adj = F.relu(learned_adj)
-                for i in range(min(3, self.model.n_nodes)):
-                    weights, indices = torch.topk(learned_adj[i], k=5)
-                    print(f"SKU {i} Strongest Learned Links: Nodes {indices.tolist()} (Weights: {weights.tolist()})")
+                # Push the static zero_ratio through the MLPs to get the current alpha vectors
+                current_alpha_c = self.model.sparsity_gate_comp(self.model.zero_ratio.unsqueeze(-1))
+                current_alpha_k = self.model.sparsity_gate_canni(self.model.zero_ratio.unsqueeze(-1))
+                
+                # Calculate metrics directly (the MLPs already output Sigmoid [0,1], so no need to apply it again!)
+                alpha_c_mean = current_alpha_c.mean().item()
+                alpha_k_mean = current_alpha_k.mean().item()
+                
+                alpha_c_std = current_alpha_c.std().item()
+                alpha_k_std = current_alpha_k.std().item()
+                
+            print(f"\n--- Epoch {self.current_epoch} End ---")
+            print(f"Alpha Complement (Mean): {alpha_c_mean:.4f} (Std: {alpha_c_std:.4f}) | Alpha Canni (Mean): {alpha_k_mean:.4f} (Std: {alpha_k_std:.4f})")
+            self.log("alpha_comp", alpha_c_mean, prog_bar=True)
+            self.log("alpha_canni", alpha_k_mean, prog_bar=True)
 
 
 class LitResidualSTGNN(pl.LightningModule):
@@ -396,22 +420,20 @@ class LitResidualSTGNN(pl.LightningModule):
     Now features a self-learning shrinkage parameter to automatically 
     calibrate the magnitude of the spatial corrections!
     """
-    def __init__(self, model, adj_matrix, learning_rate=1e-3):
+    def __init__(self, model, adj_comp, adj_canni, learning_rate=1e-3):
         super().__init__()
         self.model = model
         self.learning_rate = learning_rate
-        self.register_buffer("adj_matrix", adj_matrix)
         
-        # THE ELEGANT FIX: A learnable parameter for the residual scale.
-        # We initialize it at 0.1 so the model starts cautious, 
-        # but the optimizer will push this up or down automatically!
+        # THE FIX: Register the dual graphs instead of a single matrix
+        self.register_buffer("adj_comp", adj_comp)
+        self.register_buffer("adj_canni", adj_canni)
+        
         self.learned_shrinkage = nn.Parameter(torch.ones(1, model.n_nodes, 1) * 0.1)
 
     def forward(self, pure_x, x_future):
-        # The core model predicts the raw spatial shock
-        raw_residual = self.model(pure_x, x_future, self.adj_matrix)
-        
-        # The network scales its own prediction before outputting it!
+        # THE FIX: Pass both graphs to the core model
+        raw_residual = self.model(pure_x, x_future, self.adj_comp, self.adj_canni)
         return raw_residual * self.learned_shrinkage
 
     def training_step(self, batch, _batch_idx):

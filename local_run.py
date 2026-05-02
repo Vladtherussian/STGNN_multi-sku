@@ -8,8 +8,8 @@ if __name__ == "__main__":
     
     print("Executing the pipeline DAG...")
     
-    # 1. Start with your base selection (prepare_stgnn_tensors and everything downstream)
-    base_selection = AssetSelection.keys("evaluate_benchmark").downstream()
+    # 1. Start with your base selection (download and everything downstream)
+    base_selection = AssetSelection.keys("feature_engineering").downstream()
     
     # 2. Subtract the specific asset you want to exclude
     asset_to_exclude = ["train_statistical_baselines"]

@@ -151,6 +151,9 @@ def calculate_m5_metrics(train_df, test_df, predictions_df, models, raw_feature_
 
         # MASE
         group_mase = item_metrics.groupby('dept_name', as_index=False)['mase'].mean().rename(columns={'mase': 'value'}).assign(metric='mase', Model=model)
+        
+        # RMSE
+        group_rmsse = item_metrics.groupby('dept_name', as_index=False)['rmsse'].mean().rename(columns={'rmsse': 'value'}).assign(metric='rmsse', Model=model)
 
         # MSE
         group_mse = eval_df.groupby('dept_name', as_index=False)['se'].mean().rename(columns={'se': 'value'}).assign(metric='mse', Model=model)
@@ -159,7 +162,7 @@ def calculate_m5_metrics(train_df, test_df, predictions_df, models, raw_feature_
         group_bias = eval_df.groupby('dept_name', as_index=False).apply(lambda x: (x[model].sum() - x['y'].sum()) / (x['y'].sum() + 1e-9))\
             .rename(columns={None: 'value'}).assign(metric='bias', Model=model)
 
-        grouped_metrics = pd.concat([grouped_metrics, group_wrmsse, group_mae, group_mase, group_mse, group_bias], ignore_index=True)
+        grouped_metrics = pd.concat([grouped_metrics, group_wrmsse, group_rmsse, group_mae, group_mase, group_mse, group_bias], ignore_index=True)
         item_results = pd.concat([item_results, item_metrics.assign(Model=model)], ignore_index=True)  # Append model name for analysis
         
         # Aggregate global metrics
@@ -167,6 +170,7 @@ def calculate_m5_metrics(train_df, test_df, predictions_df, models, raw_feature_
         mae = item_metrics['ae'].mean()
         mse = item_metrics['se'].mean()
         mase = item_metrics['mase'].mean() # Overall MASE is the unweighted average across items
+        rmsse = item_metrics['rmsse'].mean()
         
         results.append({
             'Model': model,
@@ -174,6 +178,7 @@ def calculate_m5_metrics(train_df, test_df, predictions_df, models, raw_feature_
             'MSE': mse,
             'MASE': mase,
             'WRMSSE': wrmsse,
+            'RMSSE': rmsse,
             'Bias': bias
         })
     pred_dir = os.path.join(os.getcwd(), "data", "predictions")

@@ -67,7 +67,7 @@ def load_sales_data(download_m5_data: str, config: SalesDataConfig) -> tuple:
         # reduce to only Foods and TX of first 100 per dept, per store
         # Gives exactly 1,437 nodes. Fits perfectly in 10GB VRAM.
         # Cross-Departmental
-        sales_train_df = sales_train_df.query("store_id in ('TX_1') & cat_id == 'HOUSEHOLD'")
+        sales_train_df = sales_train_df.query("store_id in ('TX_2') & cat_id == 'FOODS'")
 
         # Gives exactly 1,695 nodes. (565 Hobbies items x 3 Texas Stores)
         # Geographical Supply
@@ -616,8 +616,8 @@ def train_hybrid_stgnn() -> None:
     # 2. Hyperparameters
     seq_len = 56   # 56 days of history
     pred_len = 28  # 28 days forecast
-    hidden_features = 64
-    batch_size = 8
+    hidden_features = 128
+    batch_size = 4
 
     # 3. Temporal Train/Validation/Test Split
     test_start_idx = X.shape[1] - pred_len
@@ -651,10 +651,11 @@ def train_hybrid_stgnn() -> None:
         in_features=n_features, 
         hidden_features=hidden_features,
         n_futr_features=n_futr_features,
-        zero_ratio=zero_ratio
+        zero_ratio=zero_ratio,
+        use_zip=True
     )
     
-    lit_model = LitSTGNNMixer(model=core_model, adj_comp=adj_comp, adj_canni=adj_canni, learning_rate=1e-3)
+    lit_model = LitSTGNNMixer(model=core_model, adj_comp=adj_comp, adj_canni=adj_canni, learning_rate=1e-3, use_zip=True)
 
     # 6. Ignite PyTorch Lightning & Evaluate
     early_stop_callback = EarlyStopping(monitor="val_loss", patience=3, mode="min")
@@ -665,7 +666,7 @@ def train_hybrid_stgnn() -> None:
         accelerator="auto",
         precision="16-mixed",
         gradient_clip_val=1.0,
-        # accumulate_grad_batches=2 # <--- Tells the optimizer to wait for 2 batches (4+4=8) before updating weights
+        accumulate_grad_batches=8 # <--- Tells the optimizer to wait for 2 batches (4+4=8) before updating weights
     )
 
     print(f"Igniting Custom STGNNMixer on {n_nodes} nodes...")
@@ -1151,12 +1152,12 @@ def evaluate_benchmark() -> None:
 
     # Loop through the three variations we trained
     stgnn_models = [
-        ("STGNNMixer", "stgnnmixer", "full"),
+        ("STGNNMixer", "stgnnmixer", "full", True),
         # ("STGNN_StaticGraph", "ablation_static_graph", "static_graph"),
         # ("STGNN_NoGraph", "ablation_no_graph", "no_graph")
     ]
 
-    for model_name, folder_name, ablation_mode in stgnn_models:
+    for model_name, folder_name, ablation_mode, use_zip in stgnn_models:
         weights_path = os.path.join(os.getcwd(), "data", "models", folder_name, "weights.pt")
         
         # If an ablation hasn't been trained yet, skip it gracefully
@@ -1171,27 +1172,33 @@ def evaluate_benchmark() -> None:
             seq_len=seq_len, pred_len=pred_len, n_nodes=n_nodes, 
             in_features=n_features, hidden_features=hidden_features, 
             n_futr_features=len(futr_indices), ablation_mode=ablation_mode,
-            zero_ratio=zero_ratio
+            zero_ratio=zero_ratio,
+            use_zip=use_zip
         )
         
-        lit_model = LitSTGNNMixer(model=core_model, adj_comp=adj_comp.to(device), adj_canni=adj_canni.to(device))
+        lit_model = LitSTGNNMixer(model=core_model, adj_comp=adj_comp.to(device), adj_canni=adj_canni.to(device), use_zip=use_zip)
         lit_model.load_state_dict(state_dict)
         lit_model.to(device)
         lit_model.eval()
         
         with torch.no_grad():
-            # FP32 Armor for Evaluation
             y_hist_fp32 = y_hist.float()
             mean = y_hist_fp32.mean(dim=-1, keepdim=True)
-            var = y_hist_fp32.var(dim=-1, keepdim=True, unbiased=False)
-            std = torch.sqrt(var + 1e-5)
+            std = torch.sqrt(y_hist_fp32.var(dim=-1, keepdim=True, unbiased=False) + 1e-5)
             
-            # Unpack the Tuple
-            y_hat_norm = lit_model(x_hist, x_future)
-            
-            # Upcast and denormalize
-            y_hat_raw = (y_hat_norm.float() * std) + mean
-            y_hat = F.softplus(y_hat_raw)
+            # THE FIX: Decoder Logic unpacks the tte_pred using an underscore
+            if use_zip:
+                pi_logits, lambda_norm, _ = lit_model(x_hist, x_future)
+                lambda_raw = (lambda_norm.float() * std) + mean
+                rate = F.softplus(lambda_raw) + 1e-4
+                pi = torch.sigmoid(pi_logits.float())
+                
+                # Expected Value!
+                y_hat = (1.0 - pi) * rate
+            else:
+                y_hat_norm, _ = lit_model(x_hist, x_future)
+                y_hat_raw = (y_hat_norm.float() * std) + mean
+                y_hat = F.softplus(y_hat_raw)
         
         y_hat_cpu = y_hat.squeeze(0).cpu().numpy()  # Shape: [1000, 28]
         
@@ -1283,7 +1290,10 @@ def evaluate_benchmark() -> None:
         )
         
         lit_res_model = LitResidualSTGNN(model=core_res_model, adj_comp=adj_comp.to(device), adj_canni=adj_canni.to(device))
-        lit_res_model.load_state_dict(state_dict)
+        
+        # THE FIX: strict=False tells PyTorch to ignore the missing TTE weights!
+        lit_res_model.load_state_dict(state_dict, strict=False) 
+        
         lit_res_model.to(device)
         lit_res_model.eval()
         

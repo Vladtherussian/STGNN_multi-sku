@@ -5,6 +5,21 @@ from torch.utils.data import Dataset
 import pytorch_lightning as pl
 import torch.nn.functional as F
 
+def sparsemax(X, dim=-1):
+    """A clean, fast PyTorch implementation of sparsemax for hard cutoff routing."""
+    X_sorted, _ = torch.sort(X, dim=dim, descending=True)
+    cssv = torch.cumsum(X_sorted, dim=dim) - 1
+    ind = torch.arange(1, X.shape[dim] + 1, device=X.device, dtype=X.dtype)
+    
+    # Add broadcasting dimensions to `ind`
+    for _ in range(X.dim() - dim - 1 if dim >= 0 else -dim - 1):
+        ind = ind.unsqueeze(-1)
+    
+    cond = X_sorted - cssv / ind > 0
+    rho = cond.sum(dim=dim, keepdim=True)
+    tau = torch.gather(cssv, dim=dim, index=rho - 1) / rho
+    return torch.clamp(X - tau, min=0.0)
+
 class GraphMixerBlock(nn.Module):
     """
     Upgraded to Pre-Norm Architecture for FP16 stability.
@@ -92,8 +107,9 @@ class STGNNMixer(nn.Module):
       x_proj_2d     [B, N, S*Feat]    : ~105 MB  (peak inside block)
     Total estimated peak: ~2–3 GB, leaving headroom for optimizer states.
     """
-    def __init__(self, seq_len, pred_len, n_nodes, in_features, hidden_features, n_futr_features, zero_ratio, n_blocks=2, top_k=5, ablation_mode="full"):
+    def __init__(self, seq_len, pred_len, n_nodes, in_features, hidden_features, n_futr_features, zero_ratio, n_blocks=2, top_k=5, ablation_mode="full", use_zip=False):
         super().__init__()
+        self.use_zip = use_zip
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.n_nodes = n_nodes
@@ -161,8 +177,15 @@ class STGNNMixer(nn.Module):
         # Project the future features into the same hidden dimension
         self.futr_projection = nn.Linear(n_futr_features, hidden_features)
 
+        # NEW: Time-to-Event Auxiliary Head
+        self.tte_head = nn.Sequential(
+            nn.Linear(hidden_features, 1),
+            nn.ReLU()
+        )
+
         # The final head now accepts (Historical Graph Memory) + (Future Info)
-        self.head = nn.Sequential(nn.Linear((seq_len * hidden_features) + (pred_len * hidden_features), pred_len))
+        out_dim = pred_len * 2 if self.use_zip else pred_len
+        self.head = nn.Sequential(nn.Linear((seq_len * hidden_features) + (pred_len * hidden_features), out_dim))
         
 
     def forward(self, x, x_future, adj_comp, adj_canni):
@@ -214,14 +237,15 @@ class STGNNMixer(nn.Module):
             # Sparsify Complement Graph
             comp_vals, comp_idx = torch.topk(dyn_comp, k=safe_k, dim=2)
             mask_comp = torch.zeros_like(dyn_comp).scatter_(2, comp_idx, 1.0)
-            dyn_comp = F.softmax(dyn_comp.masked_fill(mask_comp == 0, float('-inf')), dim=2)
-            dyn_comp = torch.nan_to_num(dyn_comp, nan=0.0)
+            # THE FIX: Mask with a large negative number before applying sparsemax
+            dyn_comp_masked = dyn_comp.masked_fill(mask_comp == 0, -1e4)
+            dyn_comp = sparsemax(dyn_comp_masked, dim=2)
             
             # Sparsify Cannibalization Graph
             canni_vals, canni_idx = torch.topk(dyn_canni, k=safe_k, dim=2)
             mask_canni = torch.zeros_like(dyn_canni).scatter_(2, canni_idx, 1.0)
-            dyn_canni = F.softmax(dyn_canni.masked_fill(mask_canni == 0, float('-inf')), dim=2)
-            dyn_canni = torch.nan_to_num(dyn_canni, nan=0.0)
+            dyn_canni_masked = dyn_canni.masked_fill(mask_canni == 0, -1e4)
+            dyn_canni = sparsemax(dyn_canni_masked, dim=2)
 
             # F. Dual Blend with static business rules
             static_comp_batch = adj_comp.unsqueeze(0).repeat(B, 1, 1)
@@ -253,7 +277,17 @@ class STGNNMixer(nn.Module):
         combined = torch.cat([x_hist_flat, x_futr_flat], dim=2)
         sales_forecast = self.head(combined)                        
         
-        return sales_forecast
+        # NEW: Predict TTE from the final spatial-temporal GRU state
+        x_final = x[:, :, -1, :] # Shape: [B, N, Feat]
+        tte_pred = self.tte_head(x_final).squeeze(-1) # Shape: [B, N]
+        
+        # Split the output into Probability Logits and Poisson Rate
+        if self.use_zip:
+            pi_logits = sales_forecast[:, :, :self.pred_len]
+            lambda_norm = sales_forecast[:, :, self.pred_len:]
+            return pi_logits, lambda_norm, tte_pred
+            
+        return sales_forecast, tte_pred
 
 
 class GraphTimeSeriesDataset(Dataset):
@@ -283,10 +317,11 @@ class GraphTimeSeriesDataset(Dataset):
 
 class LitSTGNNMixer(pl.LightningModule):
     """The PyTorch Lightning wrapper that handles the training loop and GPU acceleration."""
-    def __init__(self, model, adj_comp, adj_canni, learning_rate=1e-3):
+    def __init__(self, model, adj_comp, adj_canni, learning_rate=1e-3, use_zip=False):
         super().__init__()
         self.model = model
         self.learning_rate = learning_rate
+        self.use_zip = use_zip
         self.register_buffer("adj_comp", adj_comp)
         self.register_buffer("adj_canni", adj_canni)
 
@@ -296,50 +331,70 @@ class LitSTGNNMixer(pl.LightningModule):
     def training_step(self, batch, _batch_idx):
         x, y_hist, x_future, y = batch
         
-        # --- FP32 Armor ---
         y_hist_fp32 = y_hist.float()
         y_fp32 = y.float()
-        
         mean = y_hist_fp32.mean(dim=-1, keepdim=True)
         var = y_hist_fp32.var(dim=-1, keepdim=True, unbiased=False)
         std = torch.sqrt(var + 1e-5)
-        
-        # Forward pass & Softplus
-        y_hat_norm = self(x, x_future)
-        y_hat_norm = y_hat_norm.float()
-        
-        y_hat_raw = (y_hat_norm * std) + mean
-        y_hat = F.softplus(y_hat_raw) 
-        
-        y_clamp = y_fp32.clamp(min=0.0)
+        y_clamp = y.float().clamp(min=0.0)
 
         # ==========================================
-        # 1. THE FIX: Poisson Loss for the Primary Objective
+        # THE ZIP FORWARD PASS & LOSS
         # ==========================================
-        # log_input=False tells PyTorch our network is already outputting raw positive values (thanks to Softplus)
-        primary_loss = F.poisson_nll_loss(y_hat, y_clamp, log_input=False)
-        
-        # 2. Graph Consistency Loss (Kept in Log Space for Magnitude Stability)
-        # We still use log1p here strictly so the magnitude of this regularization 
-        # doesn't explode and ruin the 0.1 scaling weight.
+        if self.use_zip:
+            # THE FIX: Unpack the new tte_pred
+            pi_logits, lambda_norm, tte_pred = self(x, x_future)
+            
+            lambda_raw = (lambda_norm.float() * std) + mean
+            rate = F.softplus(lambda_raw) + 1e-4
+            pi = torch.sigmoid(pi_logits.float())
+            
+            # ZIP Log Likelihood Formula
+            prob_zero = pi + (1.0 - pi) * torch.exp(-rate)
+            log_prob_zero = torch.log(prob_zero + 1e-8)
+            log_prob_pos = torch.log(1.0 - pi + 1e-8) + y_clamp * torch.log(rate + 1e-8) - rate - torch.lgamma(y_clamp + 1.0)
+            
+            is_zero = (y_clamp == 0.0).float()
+            primary_loss = -(is_zero * log_prob_zero + (1.0 - is_zero) * log_prob_pos).mean()
+            y_hat = (1.0 - pi) * rate
+            
+        else: # Standard Poisson Fallback
+            # THE FIX: Unpack the new tte_pred
+            y_hat_norm, tte_pred = self(x, x_future)
+            y_hat_raw = (y_hat_norm.float() * std) + mean
+            y_hat = F.softplus(y_hat_raw) 
+            primary_loss = F.poisson_nll_loss(y_hat, y_clamp, log_input=False)
+
+        # Graph Consistency Loss 
         log_y = torch.log1p(y_clamp)
         log_y_hat = torch.log1p(y_hat)
-        
         residuals = log_y - log_y_hat          
         res_mean = residuals.mean(dim=-1)          
         
-        # THE FIX: Apply consistency regularization specifically to the Complement Graph, 
-        # as items in the same department should exhibit correlated errors.
         neighbor_res = torch.bmm(
             self.adj_comp.float().unsqueeze(0).expand(residuals.shape[0], -1, -1),
             res_mean.unsqueeze(-1)
         ).squeeze(-1)
-        
         graph_loss = F.mse_loss(res_mean, neighbor_res.detach())
-        loss = primary_loss + (0.1 * graph_loss)
+        
+        # ==========================================
+        # NEW: TIME-TO-EVENT (TTE) AUXILIARY LOSS
+        # ==========================================
+        # Find the exact index of the first sale in the prediction horizon
+        has_sale = (y_clamp > 0).any(dim=2)
+        first_sale_idx = torch.argmax((y_clamp > 0).float(), dim=2).float()
+        
+        # If no sale exists in the entire 28-day horizon, the TTE is 28
+        true_tte = torch.where(has_sale, first_sale_idx, torch.tensor(y_clamp.shape[2], dtype=torch.float32, device=y_clamp.device))
+        
+        # Calculate the Huber loss between predicted gap and actual gap
+        tte_loss = F.huber_loss(tte_pred, true_tte, delta=1.0)
+
+        # Blend all 3 losses! (TTE gets a small weight so it acts as a regularizer)
+        loss = primary_loss + (0.1 * graph_loss) + (0.01 * tte_loss)
         
         self.log('train_loss', loss, prog_bar=True)
-        self.log('graph_consistency_loss', graph_loss, prog_bar=False)
+        self.log('tte_loss', tte_loss, prog_bar=True) # Great for monitoring!
         return loss
 
     def validation_step(self, batch, _batch_idx):
@@ -352,18 +407,65 @@ class LitSTGNNMixer(pl.LightningModule):
         mean = y_hist_fp32.mean(dim=-1, keepdim=True)
         var = y_hist_fp32.var(dim=-1, keepdim=True, unbiased=False)
         std = torch.sqrt(var + 1e-5)
-        
-        y_hat_norm = self(x, x_future)
-        y_hat_norm = y_hat_norm.float()
-        
-        y_hat_raw = (y_hat_norm * std) + mean
-        y_hat = F.softplus(y_hat_raw) 
-        
-        y_clamp = y_fp32.clamp(min=0.0)
+        y_clamp = y.float().clamp(min=0.0)
 
-        # Track Poisson Loss in Validation as well
-        loss = F.poisson_nll_loss(y_hat, y_clamp, log_input=False)
-        self.log('val_loss', loss, prog_bar=True)
+        # ==========================================
+        # THE ZIP FORWARD PASS & LOSS
+        # ==========================================
+        if self.use_zip:
+            # THE FIX: Unpack the new tte_pred
+            pi_logits, lambda_norm, tte_pred = self(x, x_future)
+            
+            lambda_raw = (lambda_norm.float() * std) + mean
+            rate = F.softplus(lambda_raw) + 1e-4
+            pi = torch.sigmoid(pi_logits.float())
+            
+            # ZIP Log Likelihood Formula
+            prob_zero = pi + (1.0 - pi) * torch.exp(-rate)
+            log_prob_zero = torch.log(prob_zero + 1e-8)
+            log_prob_pos = torch.log(1.0 - pi + 1e-8) + y_clamp * torch.log(rate + 1e-8) - rate - torch.lgamma(y_clamp + 1.0)
+            
+            is_zero = (y_clamp == 0.0).float()
+            primary_loss = -(is_zero * log_prob_zero + (1.0 - is_zero) * log_prob_pos).mean()
+            y_hat = (1.0 - pi) * rate
+            
+        else: # Standard Poisson Fallback
+            # THE FIX: Unpack the new tte_pred
+            y_hat_norm, tte_pred = self(x, x_future)
+            y_hat_raw = (y_hat_norm.float() * std) + mean
+            y_hat = F.softplus(y_hat_raw) 
+            primary_loss = F.poisson_nll_loss(y_hat, y_clamp, log_input=False)
+
+        # Graph Consistency Loss 
+        log_y = torch.log1p(y_clamp)
+        log_y_hat = torch.log1p(y_hat)
+        residuals = log_y - log_y_hat          
+        res_mean = residuals.mean(dim=-1)          
+        
+        neighbor_res = torch.bmm(
+            self.adj_comp.float().unsqueeze(0).expand(residuals.shape[0], -1, -1),
+            res_mean.unsqueeze(-1)
+        ).squeeze(-1)
+        graph_loss = F.mse_loss(res_mean, neighbor_res.detach())
+        
+        # ==========================================
+        # NEW: TIME-TO-EVENT (TTE) AUXILIARY LOSS
+        # ==========================================
+        # Find the exact index of the first sale in the prediction horizon
+        has_sale = (y_clamp > 0).any(dim=2)
+        first_sale_idx = torch.argmax((y_clamp > 0).float(), dim=2).float()
+        
+        # If no sale exists in the entire 28-day horizon, the TTE is 28
+        true_tte = torch.where(has_sale, first_sale_idx, torch.tensor(y_clamp.shape[2], dtype=torch.float32, device=y_clamp.device))
+        
+        # Calculate the Huber loss between predicted gap and actual gap
+        tte_loss = F.huber_loss(tte_pred, true_tte, delta=1.0)
+
+        # Blend all 3 losses! (TTE gets a small weight so it acts as a regularizer)
+        loss = primary_loss + (0.1 * graph_loss) + (0.01 * tte_loss)
+        
+        self.log('val_loss', loss, prog_bar=True)   # <--- FIXED
+        self.log('val_tte_loss', tte_loss, prog_bar=True)
         return loss
     
     def test_step(self, batch, _batch_idx):
@@ -376,18 +478,65 @@ class LitSTGNNMixer(pl.LightningModule):
         mean = y_hist_fp32.mean(dim=-1, keepdim=True)
         var = y_hist_fp32.var(dim=-1, keepdim=True, unbiased=False)
         std = torch.sqrt(var + 1e-5)
-        
-        y_hat_norm = self(x, x_future)
-        y_hat_norm = y_hat_norm.float()
-        
-        y_hat_raw = (y_hat_norm * std) + mean
-        y_hat = F.softplus(y_hat_raw) 
-        
-        y_clamp = y_fp32.clamp(min=0.0)
+        y_clamp = y.float().clamp(min=0.0)
 
-        # Track Poisson Loss in Test as well
-        loss = F.poisson_nll_loss(y_hat, y_clamp, log_input=False)
-        self.log('test_loss', loss, prog_bar=True)
+        # ==========================================
+        # THE ZIP FORWARD PASS & LOSS
+        # ==========================================
+        if self.use_zip:
+            # THE FIX: Unpack the new tte_pred
+            pi_logits, lambda_norm, tte_pred = self(x, x_future)
+            
+            lambda_raw = (lambda_norm.float() * std) + mean
+            rate = F.softplus(lambda_raw) + 1e-4
+            pi = torch.sigmoid(pi_logits.float())
+            
+            # ZIP Log Likelihood Formula
+            prob_zero = pi + (1.0 - pi) * torch.exp(-rate)
+            log_prob_zero = torch.log(prob_zero + 1e-8)
+            log_prob_pos = torch.log(1.0 - pi + 1e-8) + y_clamp * torch.log(rate + 1e-8) - rate - torch.lgamma(y_clamp + 1.0)
+            
+            is_zero = (y_clamp == 0.0).float()
+            primary_loss = -(is_zero * log_prob_zero + (1.0 - is_zero) * log_prob_pos).mean()
+            y_hat = (1.0 - pi) * rate
+            
+        else: # Standard Poisson Fallback
+            # THE FIX: Unpack the new tte_pred
+            y_hat_norm, tte_pred = self(x, x_future)
+            y_hat_raw = (y_hat_norm.float() * std) + mean
+            y_hat = F.softplus(y_hat_raw) 
+            primary_loss = F.poisson_nll_loss(y_hat, y_clamp, log_input=False)
+
+        # Graph Consistency Loss 
+        log_y = torch.log1p(y_clamp)
+        log_y_hat = torch.log1p(y_hat)
+        residuals = log_y - log_y_hat          
+        res_mean = residuals.mean(dim=-1)          
+        
+        neighbor_res = torch.bmm(
+            self.adj_comp.float().unsqueeze(0).expand(residuals.shape[0], -1, -1),
+            res_mean.unsqueeze(-1)
+        ).squeeze(-1)
+        graph_loss = F.mse_loss(res_mean, neighbor_res.detach())
+        
+        # ==========================================
+        # NEW: TIME-TO-EVENT (TTE) AUXILIARY LOSS
+        # ==========================================
+        # Find the exact index of the first sale in the prediction horizon
+        has_sale = (y_clamp > 0).any(dim=2)
+        first_sale_idx = torch.argmax((y_clamp > 0).float(), dim=2).float()
+        
+        # If no sale exists in the entire 28-day horizon, the TTE is 28
+        true_tte = torch.where(has_sale, first_sale_idx, torch.tensor(y_clamp.shape[2], dtype=torch.float32, device=y_clamp.device))
+        
+        # Calculate the Huber loss between predicted gap and actual gap
+        tte_loss = F.huber_loss(tte_pred, true_tte, delta=1.0)
+
+        # Blend all 3 losses! (TTE gets a small weight so it acts as a regularizer)
+        loss = primary_loss + (0.1 * graph_loss) + (0.01 * tte_loss)
+        
+        self.log('test_loss', loss, prog_bar=True)   # <--- FIXED
+        self.log('test_tte_loss', tte_loss, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
@@ -432,8 +581,8 @@ class LitResidualSTGNN(pl.LightningModule):
         self.learned_shrinkage = nn.Parameter(torch.ones(1, model.n_nodes, 1) * 0.1)
 
     def forward(self, pure_x, x_future):
-        # THE FIX: Pass both graphs to the core model
-        raw_residual = self.model(pure_x, x_future, self.adj_comp, self.adj_canni)
+        # THE FIX: Unpack the tuple (ignore the TTE prediction with an underscore)
+        raw_residual, _ = self.model(pure_x, x_future, self.adj_comp, self.adj_canni)
         return raw_residual * self.learned_shrinkage
 
     def training_step(self, batch, _batch_idx):

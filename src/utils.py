@@ -23,7 +23,10 @@ def build_correlation_adjacency(df: pd.DataFrame, static_df: pd.DataFrame, val_s
     pivot_df = pivot_df[node_order]
     
     # 3. Calculate Pearson Correlation Matrix [Nodes x Nodes]
-    corr_matrix = pivot_df.corr(method='pearson').values
+    # corr_matrix = pivot_df.corr(method='spearman').values
+
+    # Stationarity Check (Differencing) We difference the data, drop the first NaN row, and then correlate.
+    corr_matrix = pivot_df.diff().dropna().corr(method='pearson').values
     
     # Fill NaNs (Items with completely flat 0 sales have zero variance, resulting in NaN correlation)
     corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)

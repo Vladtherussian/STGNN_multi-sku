@@ -305,6 +305,8 @@ def prepare_ml_data() -> None:
     processed_dir = os.path.join(os.getcwd(), "data", "processed")
     df = pd.read_parquet(os.path.join(processed_dir, "model_input.parquet"))
 
+    df = df[df["timestamp"] >= "2014-01-01"].copy()
+
     cols_to_drop = [
         'event_name_1', 'event_type_1', 'event_name_2', 'event_type_2', 
         'sell_price', 'base_price', 'day'

@@ -1,59 +1,146 @@
 import os
-
 import numpy as np
 import pandas as pd
 import torch
+import scipy.stats as stats
 
-def build_correlation_adjacency(df: pd.DataFrame, static_df: pd.DataFrame, val_start_date: str) -> tuple:
+def fast_gpu_granger(Y_series, X_series, max_lag=1, chunk_size=10000):
     """
-    Builds Data-Driven Complement and Cannibalization graphs using Pearson Correlation 
-    of historical training sales. Eliminates human categorical bias.
+    Batched GPU Granger Causality Test.
+    Y_series: [Num_Pairs, Time] (The target items)
+    X_series: [Num_Pairs, Time] (The predictor items)
+    Returns: p_values [Num_Pairs] array
     """
-    print("Calculating Data-Driven Pearson Correlation Matrices...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 1. Isolate Training Data (Strictly prevent future data leakage!)
+    N_pairs, T = Y_series.shape
+    p_values_all = np.ones(N_pairs)
+    
+    # Process in chunks to respect VRAM limits
+    for i in range(0, N_pairs, chunk_size):
+        end_idx = min(i + chunk_size, N_pairs)
+        
+        # Move chunk to GPU
+        Y_chunk = torch.tensor(Y_series[i:end_idx], dtype=torch.float32, device=device)
+        X_chunk = torch.tensor(X_series[i:end_idx], dtype=torch.float32, device=device)
+        
+        # Create Lagged Tensors: Shape [Batch, Time-1, 1]
+        Y_target = Y_chunk[:, 1:].unsqueeze(-1)
+        Y_lagged = Y_chunk[:, :-1].unsqueeze(-1)
+        X_lagged = X_chunk[:, :-1].unsqueeze(-1)
+        ones = torch.ones_like(Y_lagged)
+        
+        # Build the Design Matrices
+        A_R = torch.cat([Y_lagged, ones], dim=-1)                # Restricted
+        A_UR = torch.cat([Y_lagged, X_lagged, ones], dim=-1)     # Unrestricted
+        
+        # Solve Least Squares (Batched)
+        beta_R = torch.linalg.lstsq(A_R, Y_target).solution
+        beta_UR = torch.linalg.lstsq(A_UR, Y_target).solution
+        
+        # Calculate Residuals via Batched Matrix Multiplication
+        pred_R = torch.bmm(A_R, beta_R)
+        pred_UR = torch.bmm(A_UR, beta_UR)
+        
+        # Sum of Squared Residuals [Batch]
+        SSR_R = torch.sum((Y_target - pred_R)**2, dim=[1, 2]).cpu().numpy()
+        SSR_UR = torch.sum((Y_target - pred_UR)**2, dim=[1, 2]).cpu().numpy()
+        
+        # Calculate F-Statistic
+        df_num = 1
+        df_denom = Y_target.shape[1] - A_UR.shape[2]
+        
+        # Safeguard against zero variance division
+        SSR_UR = np.where(SSR_UR == 0, 1e-10, SSR_UR)
+        
+        f_stats = ((SSR_R - SSR_UR) / df_num) / (SSR_UR / df_denom)
+        f_stats = np.clip(f_stats, 0, None) # Clip numerical precision errors
+        
+        # Calculate P-Values on CPU using SciPy
+        p_vals = stats.f.sf(f_stats, df_num, df_denom)
+        p_values_all[i:end_idx] = p_vals
+        
+    return p_values_all
+
+
+def build_correlation_adjacency(df: pd.DataFrame, static_df: pd.DataFrame, val_start_date: str, granger: bool = False) -> tuple:
+    """
+    Builds Asymmetric, Directed Causal Graphs using Pre-Filtered GPU Granger Causality,
+    or falls back to undirected Pearson if granger=False.
+    """
+    print(f"Building {'Granger' if granger else 'Pearson'} Causality Matrices...")
+    
+    # 1. Isolate Training Data 
     train_df = df[df['ds'] < val_start_date].copy()
     
     # 2. Pivot to get [Time x Nodes] matrix
-    # Fill missing days with 0 to ensure accurate variance calculation
     pivot_df = train_df.pivot(index='ds', columns='unique_id', values='y').fillna(0)
     
-    # Ensure the columns exactly match the sorted order of your PyTorch Tensors
+    # Ensure columns match PyTorch Tensor indices
     node_order = static_df['unique_id'].tolist()
     pivot_df = pivot_df[node_order]
     
-    # 3. Calculate Pearson Correlation Matrix [Nodes x Nodes]
-    # corr_matrix = pivot_df.corr(method='spearman').values
-
-    # Stationarity Check (Differencing) We difference the data, drop the first NaN row, and then correlate.
-    corr_matrix = pivot_df.diff().dropna().corr(method='pearson').values
+    # 3. Differenced Data (Granger Causality requires Stationary Data)
+    diff_df = pivot_df.diff().dropna()
+    diff_values = diff_df.values.T # Transpose to [Nodes, Time] for fast indexing
     
-    # Fill NaNs (Items with completely flat 0 sales have zero variance, resulting in NaN correlation)
+    # 4. Fast Undirected Pass (Pearson) to find Candidates
+    corr_matrix = diff_df.corr(method='pearson').values
     corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
     
-    # 4. Split into True Complements and True Substitutes
-    # We use thresholds to act as a noise filter. We only want strong economic signals.
-    pos_threshold = 0.05  # Positive correlation = Halo Effect
-    neg_threshold = -0.05 # Negative correlation = Cannibalization
+    pos_threshold = 0.05
+    neg_threshold = -0.05
     
-    adj_comp = np.where(corr_matrix > pos_threshold, corr_matrix, 0.0)
+    # Get indices of candidate pairs (y_idx = Target, x_idx = Predictor)
+    comp_y_idx, comp_x_idx = np.where(corr_matrix > pos_threshold)
+    canni_y_idx, canni_x_idx = np.where(corr_matrix < neg_threshold)
     
-    # For cannibalization, we take the ABSOLUTE value. The GNN spatial routing requires 
-    # positive edge weights to pass the signal. The network's alpha scalars will handle the rest.
-    adj_canni = np.where(corr_matrix < neg_threshold, np.abs(corr_matrix), 0.0) 
+    # Remove self-loops
+    comp_mask = comp_y_idx != comp_x_idx
+    comp_y_idx, comp_x_idx = comp_y_idx[comp_mask], comp_x_idx[comp_mask]
     
-    # 5. The Geographic Firewall (Store Mask)
-    # Even if sales correlate, items in TX_1 cannot physically interact with items in TX_2
-    # store_vals = static_df['store_id'].values
-    # store_mask = (store_vals[:, None] == store_vals[None, :]).astype(float)
+    canni_mask = canni_y_idx != canni_x_idx
+    canni_y_idx, canni_x_idx = canni_y_idx[canni_mask], canni_x_idx[canni_mask]
     
-    # adj_comp = adj_comp * store_mask
-    # adj_canni = adj_canni * store_mask
-    
-    # Remove self-loops from cannibalization (an item cannot substitute itself)
-    np.fill_diagonal(adj_canni, 0.0)
-    
-    # 6. Row-Normalize to prevent exploding gradients during message passing
+    # THE FIX: Initialize the matrices outside the if-statement!
+    N = len(node_order)
+    adj_comp = np.zeros((N, N), dtype=np.float32)
+    adj_canni = np.zeros((N, N), dtype=np.float32)
+
+    if granger:
+        print(f"Pre-filter found {len(comp_y_idx)} Complement candidates and {len(canni_y_idx)} Cannibalization candidates.")
+        print("Running GPU Batched Granger Causal Discovery...")
+        
+        # ---------------- GRANGER COMPLEMENTS ----------------
+        if len(comp_y_idx) > 0:
+            Y_comp = diff_values[comp_y_idx]
+            X_comp = diff_values[comp_x_idx]
+            p_vals_comp = fast_gpu_granger(Y_comp, X_comp)
+            
+            # Keep only statistically significant causal edges (p < 0.05)
+            sig_comp = p_vals_comp < 0.05
+            weights_comp = corr_matrix[comp_y_idx[sig_comp], comp_x_idx[sig_comp]]
+            adj_comp[comp_y_idx[sig_comp], comp_x_idx[sig_comp]] = weights_comp
+            
+        # ---------------- GRANGER CANNIBALIZATION ----------------
+        if len(canni_y_idx) > 0:
+            Y_canni = diff_values[canni_y_idx]
+            X_canni = diff_values[canni_x_idx]
+            p_vals_canni = fast_gpu_granger(Y_canni, X_canni)
+            
+            # Keep only statistically significant causal edges (p < 0.05)
+            sig_canni = p_vals_canni < 0.05
+            weights_canni = np.abs(corr_matrix[canni_y_idx[sig_canni], canni_x_idx[sig_canni]])
+            adj_canni[canni_y_idx[sig_canni], canni_x_idx[sig_canni]] = weights_canni
+            
+    else:
+        # THE FIX: Fallback to standard Pearson if granger=False
+        if len(comp_y_idx) > 0:
+            adj_comp[comp_y_idx, comp_x_idx] = corr_matrix[comp_y_idx, comp_x_idx]
+        if len(canni_y_idx) > 0:
+            adj_canni[canni_y_idx, canni_x_idx] = np.abs(corr_matrix[canni_y_idx, canni_x_idx])
+
+    # 6. Row-Normalize to prevent gradient explosion
     def normalize_graph(matrix):
         row_sums = matrix.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1.0 

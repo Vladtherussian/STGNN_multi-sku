@@ -67,7 +67,7 @@ def load_sales_data(download_m5_data: str, config: SalesDataConfig) -> tuple:
         # reduce to only Foods and TX of first 100 per dept, per store
         # Gives exactly 1,437 nodes. Fits perfectly in 10GB VRAM.
         # Cross-Departmental
-        sales_train_df = sales_train_df.query("store_id in ('TX_2') & cat_id == 'FOODS'")
+        sales_train_df = sales_train_df.query("store_id in ('TX_2') & cat_id == 'HOBBIES'")
 
         # Gives exactly 1,695 nodes. (565 Hobbies items x 3 Texas Stores)
         # Geographical Supply
@@ -641,9 +641,9 @@ def train_hybrid_stgnn() -> None:
     val_dataset = GraphTimeSeriesDataset(X_val, y_val, seq_len, pred_len, futr_indices)
     test_dataset = GraphTimeSeriesDataset(X_test, y_test, seq_len, pred_len, futr_indices)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,num_workers=4, pin_memory=True)  # Added num_workers and pin_memory for performance
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, num_workers=4, pin_memory=True)
 
     # 5. Initialize the Custom Hybrid Architecture
     core_model = STGNNMixer(
